@@ -1,0 +1,53 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "OrderService",
+      "type": "dotnet",
+      "request": "launch",
+      "preLaunchTask": "build",
+      "projectPath": "${workspaceFolder}/OrderService/OrderService.csproj",
+      "launchBrowser": {
+        "enabled": true,
+        "args": "${workspaceFolder}/OrderService/Properties/launchSettings.json",
+        "windows": {
+          "command": "cmd.exe",
+          "args": "/C start http://localhost:5085/swagger"
+        },
+        "osx": {
+          "command": "open",
+          "args": "http://localhost:5085/swagger"
+        },
+        "linux": {
+          "command": "xdg-open",
+          "args": "http://localhost:5085/swagger"
+        }
+      }
+    },
+    {
+      "name": "InventoryService",
+      "type": "dotnet",
+      "request": "launch",
+      "preLaunchTask": "build",
+      "projectPath": "${workspaceFolder}/InventoryService/InventoryService.csproj"
+    },
+    {
+      "name": "PaymentService",
+      "type": "dotnet",
+      "request": "launch",
+      "preLaunchTask": "build",
+      "projectPath": "${workspaceFolder}/PaymentService/PaymentService.csproj"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "All Services",
+      "configurations": [
+        "OrderService",
+        "InventoryService",
+        "PaymentService"
+      ],
+      "stopAll": true
+    }
+  ]
+}

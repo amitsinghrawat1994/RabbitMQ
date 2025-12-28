@@ -25,15 +25,14 @@ Before starting any .NET services, the messaging infrastructure must be up.
 
 You need to run all three services simultaneously.
 
-### Option A: Using Visual Studio / Rider
-1.  Right-click the Solution in Solution Explorer.
-2.  Select **"Set Startup Projects"**.
-3.  Choose **"Multiple startup projects"**.
-4.  Set **Start** action for:
-    *   `OrderService`
-    *   `InventoryService`
-    *   `PaymentService`
-5.  Press **F5** or click **Start**.
+### Option A: Using VS Code (Recommended)
+1.  Open the project in **VS Code**.
+2.  Ensure you have the **C# Dev Kit** or **C#** (Omnisharp) extension installed.
+3.  Go to the **Run and Debug** view (`Ctrl+Shift+D`).
+4.  From the dropdown at the top, select **"All Services"**.
+5.  Click the **Green Arrow (Start Debugging)**.
+    *   This will launch `OrderService`, `InventoryService`, and `PaymentService` simultaneously.
+    *   The `OrderService` will automatically open the browser to the Swagger UI.
 
 ### Option B: Using Terminal (CLI)
 Open **three separate terminal windows** and run:
