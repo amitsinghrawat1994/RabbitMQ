@@ -1,6 +1,44 @@
 @OrderService_HostAddress = http://localhost:5085
 
-GET {{OrderService_HostAddress}}/weatherforecast/
-Accept: application/json
+### Submit Order - Happy Path (Success)
+# Most IDs will succeed unless they end in 0, 1, or 2.
+POST {{OrderService_HostAddress}}/Order
+Content-Type: application/json
 
-###
+{
+  "customerNumber": "CUST-101",
+  "totalAmount": 150.50
+}
+
+### Submit Order - Stock Shortage (Fails at Inventory)
+# GUID ending in 0 is simulated as a failure in InventoryService/CheckInventoryConsumer.cs
+# Note: You can't easily force a random Guid to end in '0' via .http file, 
+# so you may need to use a specific Guid in the Controller if you want to test this via HTTP file easily.
+# However, the current code generates a NEW Guid in the controller, so these will be random.
+POST {{OrderService_HostAddress}}/Order
+Content-Type: application/json
+
+{
+  "customerNumber": "CUST-STOCK-FAIL",
+  "totalAmount": 99.00
+}
+
+### Submit Order - Payment Failure (Fails at Payment)
+# GUID ending in 1 is simulated as a failure in PaymentService/ProcessPaymentConsumer.cs
+POST {{OrderService_HostAddress}}/Order
+Content-Type: application/json
+
+{
+  "customerNumber": "CUST-PAY-FAIL",
+  "totalAmount": 200.00
+}
+
+### Submit Order - Payment Retry (Transient Exception)
+# GUID ending in 2 throws an exception to trigger MassTransit Retry Policy
+POST {{OrderService_HostAddress}}/Order
+Content-Type: application/json
+
+{
+  "customerNumber": "CUST-RETRY",
+  "totalAmount": 50.00
+}

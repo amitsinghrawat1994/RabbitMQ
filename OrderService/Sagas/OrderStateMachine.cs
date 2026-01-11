@@ -29,9 +29,9 @@ namespace OrderService.Sagas
                     })
                     .TransitionTo(Submitted)
                     // Use PublishAsync with Init for clean interface publishing
-                    .PublishAsync(context => context.Init<CheckInventory>(new 
-                    { 
-                        OrderId = context.Saga.CorrelationId 
+                    .PublishAsync(context => context.Init<CheckInventory>(new
+                    {
+                        OrderId = context.Saga.CorrelationId
                     }))
             );
 
@@ -39,18 +39,18 @@ namespace OrderService.Sagas
                 When(StockReserved)
                     .Then(context => context.Saga.Updated = DateTime.UtcNow)
                     .TransitionTo(InventoryReserved)
-                    .PublishAsync(context => context.Init<ProcessPayment>(new 
-                    { 
+                    .PublishAsync(context => context.Init<ProcessPayment>(new
+                    {
                         OrderId = context.Saga.CorrelationId,
                         Amount = context.Saga.TotalAmount,
-                        CardNumber = "1234-5678-9012-3456" 
+                        CardNumber = "1234-5678-9012-3456"
                     })),
-                
+
                 When(StockShortage)
                     .Then(context => context.Saga.Updated = DateTime.UtcNow)
                     .TransitionTo(Failed)
-                    .PublishAsync(context => context.Init<OrderFailed>(new 
-                    { 
+                    .PublishAsync(context => context.Init<OrderFailed>(new
+                    {
                         OrderId = context.Saga.CorrelationId,
                         Reason = context.Message.Reason
                     }))
@@ -60,17 +60,17 @@ namespace OrderService.Sagas
                 When(PaymentAccepted)
                     .Then(context => context.Saga.Updated = DateTime.UtcNow)
                     .TransitionTo(Completed)
-                    .PublishAsync(context => context.Init<OrderCompleted>(new 
-                    { 
-                        OrderId = context.Saga.CorrelationId 
+                    .PublishAsync(context => context.Init<OrderCompleted>(new
+                    {
+                        OrderId = context.Saga.CorrelationId
                     }))
-                    .Finalize(), 
+                    .Finalize(),
 
                 When(PaymentFailed)
                     .Then(context => context.Saga.Updated = DateTime.UtcNow)
                     .TransitionTo(Failed)
-                    .PublishAsync(context => context.Init<OrderFailed>(new 
-                    { 
+                    .PublishAsync(context => context.Init<OrderFailed>(new
+                    {
                         OrderId = context.Saga.CorrelationId,
                         Reason = context.Message.Reason
                     }))
@@ -79,15 +79,15 @@ namespace OrderService.Sagas
             SetCompletedWhenFinalized();
         }
 
-        public State Submitted { get; private set; }
-        public State InventoryReserved { get; private set; }
-        public State Completed { get; private set; }
-        public State Failed { get; private set; }
+        public State Submitted { get; private set; } = null!;
+        public State InventoryReserved { get; private set; } = null!;
+        public State Completed { get; private set; } = null!;
+        public State Failed { get; private set; } = null!;
 
-        public Event<OrderSubmitted> OrderSubmitted { get; private set; }
-        public Event<StockReserved> StockReserved { get; private set; }
-        public Event<StockShortage> StockShortage { get; private set; }
-        public Event<PaymentAccepted> PaymentAccepted { get; private set; }
-        public Event<PaymentFailed> PaymentFailed { get; private set; }
+        public Event<OrderSubmitted> OrderSubmitted { get; private set; } = null!;
+        public Event<StockReserved> StockReserved { get; private set; } = null!;
+        public Event<StockShortage> StockShortage { get; private set; } = null!;
+        public Event<PaymentAccepted> PaymentAccepted { get; private set; } = null!;
+        public Event<PaymentFailed> PaymentFailed { get; private set; } = null!;
     }
 }
