@@ -27,8 +27,8 @@ namespace ECommerce.Tests
             var harness = provider.GetRequiredService<ITestHarness>();
             await harness.Start();
 
-            // Use a GUID that does NOT end in '0'
-            var orderId = Guid.Parse("3fa85f64-5717-4562-b3fc-2c963f66afa3");
+            // Use a GUID string that does NOT end in '0'
+            var orderId = "3fa85f64-5717-4562-b3fc-2c963f66afa3";
 
             await harness.Bus.Publish<CheckInventory>(new
             {
@@ -54,8 +54,8 @@ namespace ECommerce.Tests
             var harness = provider.GetRequiredService<ITestHarness>();
             await harness.Start();
 
-            // Use a GUID that ends in '0'
-            var orderId = Guid.Parse("3fa85f64-5717-4562-b3fc-2c963f66afa0");
+            // Use a GUID string that ends in '0'
+            var orderId = "3fa85f64-5717-4562-b3fc-2c963f66afa0";
 
             await harness.Bus.Publish<CheckInventory>(new
             {

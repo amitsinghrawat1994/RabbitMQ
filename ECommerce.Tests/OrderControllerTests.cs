@@ -46,7 +46,8 @@ namespace ECommerce.Tests
             var publishedMessage = harness.Published.Select<OrderSubmitted>().First();
             Assert.Equal(request.CustomerNumber, publishedMessage.Context.Message.CustomerNumber);
             Assert.Equal(request.TotalAmount, publishedMessage.Context.Message.TotalAmount);
-            Assert.NotEqual(Guid.Empty, publishedMessage.Context.Message.OrderId);
+            Assert.False(string.IsNullOrEmpty(publishedMessage.Context.Message.OrderId));
+            Assert.True(Guid.TryParse(publishedMessage.Context.Message.OrderId, out _));
         }
     }
 }

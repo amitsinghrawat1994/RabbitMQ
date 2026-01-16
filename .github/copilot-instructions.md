@@ -27,13 +27,42 @@ OrderService (API + Saga) orchestrates InventoryService and PaymentService via R
 - Tests use in-memory MassTransit harness — prefer adding harness tests before spinning real RabbitMQ.
 
 ## How to run & validate locally ▶️
-1. Start infra: `docker-compose up -d` (repo root). RabbitMQ UI: http://localhost:15672 (guest/guest).
-2. Start services (either VS Code "All Services" launch or CLI):
-   - `dotnet run --project OrderService`
-   - `dotnet run --project InventoryService`
-   - `dotnet run --project PaymentService`
-3. Reproduce scenarios using Swagger or POST `/Order`. Use GUIDs to exercise `0/1/2` behaviors.
-4. Run tests: `dotnet test` (runs fast with TestHarness).
+
+1. Start infrastructure (RabbitMQ + observability):
+   - docker-compose up -d (repo root). RabbitMQ Management UI: http://localhost:15672 (guest/guest).
+   - Useful ports: RabbitMQ AMQP 5672, RabbitMQ UI 15672, Jaeger UI 16686, OTLP gRPC 4317, Prometheus 9090.
+
+2. Start the services (two options):
+
+   Option A — VS Code (recommended):
+   - Open the workspace in VS Code.
+   - Ensure **C# Dev Kit** or **C# (Omnisharp)** is installed.
+   - In Run & Debug (`Ctrl+Shift+D`) select **"All Services"** and start. This launches `OrderService`, `InventoryService`, and `PaymentService` together and opens Swagger (`http://localhost:5085/swagger`).
+
+   Option B — CLI (3 terminals):
+   - `cd OrderService` && `dotnet run` (Order API + Saga, Swagger at `http://localhost:5085/swagger`)
+   - `cd InventoryService` && `dotnet run` (Inventory worker)
+   - `cd PaymentService` && `dotnet run` (Payment worker)
+
+3. Exercise scenarios and validate behavior:
+   - Submit orders via Swagger or curl: `POST http://localhost:5085/Order` with JSON `{ "customerNumber": "12345", "totalAmount": 100.00 }` (or include an `orderId` GUID to control the test suffix).
+   - Deterministic test rules (GUID last digit): `0` → StockShortage, `1` → PaymentFailed, `2` → Transient failure → retries → DLQ.
+   - Inspect RabbitMQ queues/exchanges at the Management UI. Check `orders-saga`, `inventory-service`, and `payment-service` queues and `_error` queues for failed messages.
+
+4. Run tests (fast, in-memory harness):
+   - `dotnet test` (project: `ECommerce.Tests`). Tests use `MassTransit.TestHarness` so RabbitMQ is not required for unit/integration runs.
+
+## Observability & Debugging 🔍
+- Tracing: OTLP exporter set to `http://localhost:4317`; Jaeger UI at `http://localhost:16686` (see `docker-compose.yml` and service `Program.cs`).
+- Use VS Code compound launch (All Services) to hit breakpoints in `OrderStateMachine` or consumer classes (`CheckInventoryConsumer`, `ProcessPaymentConsumer`).
+- To reproduce failing scenarios and trace message flows, submit a request and watch RabbitMQ Management UI message rates and exchanges (Contracts:<MessageName> bindings).
+
+## Troubleshooting ⚠️
+- "Connection refused" to RabbitMQ: run `docker ps` and ensure the `rabbitmq` container is healthy.
+- `orders.db` locked: stop `OrderService`, remove `OrderService/orders.db` (and `-shm`, `-wal` files) and restart — DB is auto-created on startup.
+- Messages in `_error` queues indicate consumers failed after retries; inspect the queue and message details in the Management UI to get exception traces.
+- If ports or URLs differ on your machine, check `OrderService/Properties/launchSettings.json` and relevant `appsettings.json` files.
+
 
 ## Optimized plan for changes (priority list) ⚡
 1. **Design change:** Decide if message changes are breaking. If yes, add a backwards-compatible message version or deprecation cycle.

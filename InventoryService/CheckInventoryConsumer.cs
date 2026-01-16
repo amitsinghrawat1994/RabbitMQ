@@ -27,14 +27,14 @@ namespace InventoryService
             // If the OrderId ends in '0', simulate shortage.
             // Otherwise, reserve stock.
             // This is deterministic for testing, but 'random' enough for a demo.
-            
-            // Convert Guid to string to check last char
-            var guidString = orderId.ToString();
-            
+
+            // OrderId is a string — check the last char
+            var guidString = orderId;
+
             if (guidString.EndsWith("0"))
             {
                 _logger.LogWarning("Stock shortage for Order: {OrderId}", orderId);
-                
+
                 await context.Publish<StockShortage>(new
                 {
                     OrderId = orderId,

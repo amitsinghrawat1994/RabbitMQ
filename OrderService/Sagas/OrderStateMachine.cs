@@ -8,12 +8,14 @@ namespace OrderService.Sagas
     {
         public OrderStateMachine()
         {
-            // correlate events to the saga instance
-            Event(() => OrderSubmitted, x => x.CorrelateById(m => m.Message.OrderId));
-            Event(() => StockReserved, x => x.CorrelateById(m => m.Message.OrderId));
-            Event(() => StockShortage, x => x.CorrelateById(m => m.Message.OrderId));
-            Event(() => PaymentAccepted, x => x.CorrelateById(m => m.Message.OrderId));
-            Event(() => PaymentFailed, x => x.CorrelateById(m => m.Message.OrderId));
+            // correlate events to the saga instance (messages carry string OrderId — correlate by saga.OrderId)
+            Event(() => OrderSubmitted, x => x.CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId)
+                .SelectId(context => Guid.NewGuid()));
+            Event(() => StockReserved, x => x.CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId));
+            Event(() => StockShortage, x => x.CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId));
+            Event(() => PaymentAccepted, x => x.CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId));
+            Event(() => PaymentFailed, x => x.CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId));
+
 
             // Define states
             InstanceState(x => x.CurrentState);
@@ -22,6 +24,7 @@ namespace OrderService.Sagas
                 When(OrderSubmitted)
                     .Then(context =>
                     {
+                        context.Saga.OrderId = context.Message.OrderId;
                         context.Saga.Created = DateTime.UtcNow;
                         context.Saga.Updated = DateTime.UtcNow;
                         context.Saga.CustomerNumber = context.Message.CustomerNumber;
@@ -31,7 +34,7 @@ namespace OrderService.Sagas
                     // Use PublishAsync with Init for clean interface publishing
                     .PublishAsync(context => context.Init<CheckInventory>(new
                     {
-                        OrderId = context.Saga.CorrelationId
+                        OrderId = context.Saga.OrderId
                     }))
             );
 
@@ -41,7 +44,7 @@ namespace OrderService.Sagas
                     .TransitionTo(InventoryReserved)
                     .PublishAsync(context => context.Init<ProcessPayment>(new
                     {
-                        OrderId = context.Saga.CorrelationId,
+                        OrderId = context.Saga.OrderId,
                         Amount = context.Saga.TotalAmount,
                         CardNumber = "1234-5678-9012-3456"
                     })),
@@ -51,7 +54,7 @@ namespace OrderService.Sagas
                     .TransitionTo(Failed)
                     .PublishAsync(context => context.Init<OrderFailed>(new
                     {
-                        OrderId = context.Saga.CorrelationId,
+                        OrderId = context.Saga.OrderId,
                         Reason = context.Message.Reason
                     }))
             );
@@ -62,7 +65,7 @@ namespace OrderService.Sagas
                     .TransitionTo(Completed)
                     .PublishAsync(context => context.Init<OrderCompleted>(new
                     {
-                        OrderId = context.Saga.CorrelationId
+                        OrderId = context.Saga.CorrelationId.ToString()
                     }))
                     .Finalize(),
 
@@ -71,7 +74,7 @@ namespace OrderService.Sagas
                     .TransitionTo(Failed)
                     .PublishAsync(context => context.Init<OrderFailed>(new
                     {
-                        OrderId = context.Saga.CorrelationId,
+                        OrderId = context.Saga.OrderId,
                         Reason = context.Message.Reason
                     }))
             );

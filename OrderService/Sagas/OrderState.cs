@@ -8,6 +8,8 @@ namespace OrderService.Sagas
         public Guid CorrelationId { get; set; }
         public string CurrentState { get; set; } = null!;
 
+        public string OrderId { get; set; } = null!;
+
         public DateTime Created { get; set; }
         public DateTime Updated { get; set; }
 
@@ -15,6 +17,6 @@ namespace OrderService.Sagas
         public decimal TotalAmount { get; set; }
         public Guid? PaymentId { get; set; } // Just an example of extra data
 
-        public byte[] RowVersion { get; set; } = Array.Empty<byte>();
+
     }
 }

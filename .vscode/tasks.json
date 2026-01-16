@@ -2,9 +2,23 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "kill-services",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-Command",
+        "Get-Process -Name OrderService,InventoryService,PaymentService -ErrorAction SilentlyContinue | Stop-Process -Force; exit 0"
+      ],
+      "presentation": {
+        "reveal": "silent",
+        "panel": "shared"
+      }
+    },
+    {
       "label": "build-order",
       "command": "dotnet",
       "type": "process",
+      "dependsOn": "kill-services",
       "args": [
         "build",
         "${workspaceFolder}/OrderService/OrderService.csproj",
@@ -17,6 +31,7 @@
       "label": "build-inventory",
       "command": "dotnet",
       "type": "process",
+      "dependsOn": "kill-services",
       "args": [
         "build",
         "${workspaceFolder}/InventoryService/InventoryService.csproj",
@@ -29,6 +44,7 @@
       "label": "build-payment",
       "command": "dotnet",
       "type": "process",
+      "dependsOn": "kill-services",
       "args": [
         "build",
         "${workspaceFolder}/PaymentService/PaymentService.csproj",

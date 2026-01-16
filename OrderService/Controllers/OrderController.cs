@@ -21,7 +21,7 @@ namespace OrderService.Controllers
         [HttpPost]
         public async Task<IActionResult> SubmitOrder([FromBody] OrderRequest request)
         {
-            var orderId = Guid.NewGuid();
+            var orderId = request.OrderId ?? Guid.NewGuid().ToString();
 
             await _publishEndpoint.Publish<OrderSubmitted>(new
             {

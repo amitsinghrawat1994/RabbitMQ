@@ -19,10 +19,10 @@ namespace PaymentService
         {
             var orderId = context.Message.OrderId;
             var amount = context.Message.Amount;
-            
+
             _logger.LogInformation("Processing payment for Order: {OrderId}, Amount: {Amount}", orderId, amount);
 
-            var guidString = orderId.ToString();
+            var guidString = orderId;
 
             // 1. Logic: Hard Fail
             if (guidString.EndsWith("1"))
@@ -38,9 +38,7 @@ namespace PaymentService
 
             // 2. Logic: Transient Failure (to demonstrate Retry)
             // We use a static counter or random to ensure it eventually passes, 
-            // but for a strict 'EndsWith 2' test, it would retry forever until DLQ.
-            // Let's use a random check to allow it to pass eventually if we want, 
-            // OR just let it go to DLQ to demonstrate DLQ.
+            // but for a strict 'EndsWith 2' test, it would retry according to the configured retry policy and then end up in the _error queue if it keeps failing.
             // Let's let it go to DLQ for '2'.
             if (guidString.EndsWith("2"))
             {

@@ -27,8 +27,8 @@ namespace ECommerce.Tests
             var harness = provider.GetRequiredService<ITestHarness>();
             await harness.Start();
 
-            // Valid GUID (ends in not 1 or 2)
-            var orderId = Guid.Parse("3fa85f64-5717-4562-b3fc-2c963f66afa3");
+            // Valid GUID (ends in not 1 or 2) - send as string
+            var orderId = "3fa85f64-5717-4562-b3fc-2c963f66afa3";
 
             await harness.Bus.Publish<ProcessPayment>(new
             {
@@ -55,7 +55,7 @@ namespace ECommerce.Tests
             await harness.Start();
 
             // Invalid GUID (ends in 1)
-            var orderId = Guid.Parse("3fa85f64-5717-4562-b3fc-2c963f66afa1");
+            var orderId = "3fa85f64-5717-4562-b3fc-2c963f66afa1";
 
             await harness.Bus.Publish<ProcessPayment>(new
             {
@@ -82,7 +82,7 @@ namespace ECommerce.Tests
             await harness.Start();
 
             // Error GUID (ends in 2)
-            var orderId = Guid.Parse("3fa85f64-5717-4562-b3fc-2c963f66afa2");
+            var orderId = "3fa85f64-5717-4562-b3fc-2c963f66afa2";
 
             await harness.Bus.Publish<ProcessPayment>(new
             {
@@ -92,12 +92,12 @@ namespace ECommerce.Tests
 
             // The consumer should throw, which means it consumed but faulted.
             Assert.True(await harness.Consumed.Any<ProcessPayment>());
-            
+
             // In the harness, faulted messages are tracked
             // We verify synchronously since we already awaited the consumption above
             var consumedMessages = harness.Consumed.Select<ProcessPayment>().ToList();
             Assert.Contains(consumedMessages, x => x.Context.Message.OrderId == orderId && x.Exception != null);
-            
+
             Assert.False(await harness.Published.Any<PaymentAccepted>());
             Assert.False(await harness.Published.Any<PaymentFailed>());
         }
