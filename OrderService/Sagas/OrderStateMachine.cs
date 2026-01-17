@@ -46,7 +46,8 @@ namespace OrderService.Sagas
                     {
                         OrderId = context.Saga.OrderId,
                         Amount = context.Saga.TotalAmount,
-                        CardNumber = "1234-5678-9012-3456"
+                        // Use a non-sensitive test token in demos; replace with secure tokenization in real systems
+                        CardNumber = "test-card-token"
                     })),
 
                 When(StockShortage)
@@ -65,7 +66,8 @@ namespace OrderService.Sagas
                     .TransitionTo(Completed)
                     .PublishAsync(context => context.Init<OrderCompleted>(new
                     {
-                        OrderId = context.Saga.CorrelationId.ToString()
+                        // Publish the business OrderId so downstream consumers have a stable identifier
+                        OrderId = context.Saga.OrderId
                     }))
                     .Finalize(),
 

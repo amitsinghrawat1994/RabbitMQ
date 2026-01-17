@@ -1,0 +1,44 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "dotnet build": true,
+        "/^dotnet test \"d:\\\\Personal\\\\Azure_Testing\\\\RabbitMQ\\\\ECommerce\\.Tests\\\\ECommerce\\.Tests\\.csproj\" --logger \"console;verbosity=normal\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^dotnet test \"d:\\\\Personal\\\\Azure_Testing\\\\RabbitMQ\\\\ECommerce\\.Tests\\\\ECommerce\\.Tests\\.csproj\" --filter \"FullyQualifiedName~OrderPersistenceTests\\|FullyQualifiedName~OrderControllerTests\" -v minimal$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^dotnet test \"d:\\\\Personal\\\\Azure_Testing\\\\RabbitMQ\\\\ECommerce\\.Tests\\\\ECommerce\\.Tests\\.csproj\" --filter \"FullyQualifiedName~OrderSagaTests\\.Should_Process_Order_Happy_Path\" -v minimal$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^dotnet test \"d:\\\\Personal\\\\Azure_Testing\\\\RabbitMQ\\\\ECommerce\\.Tests\\\\ECommerce\\.Tests\\.csproj\" --filter \"FullyQualifiedName~OrderSagaTests\\.Should_Fail_When_Payment_Rejected\" -v minimal$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "dotnet test": true,
+        "/^dotnet add d:\\\\Personal\\\\Azure_Testing\\\\RabbitMQ\\\\PaymentService\\\\PaymentService\\.csproj package prometheus-net$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "docker-compose": true,
+        "tasklist": true,
+        "/^powershell -Command \"Invoke-RestMethod -Uri 'http://localhost:5085/Order' -Method Post -ContentType 'application/json' -Body \\(Get-Content 'smoke-order\\.json' -Raw\\)\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^Start-Sleep -Seconds 3; powershell -Command \"Invoke-RestMethod -Uri 'http://localhost:5085/Order/00000000-0000-0000-0000-000000000003' -Method Get \\| ConvertTo-Json -Depth 5\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^powershell -Command \"Invoke-RestMethod -Uri 'http://localhost:5085/metrics' \\| Select-String -Pattern 'order_submitted_total\\|order_completed_total\\|order_failed_total'\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "/^powershell -Command \"Invoke-RestMethod -Uri 'http://localhost:9181/metrics' \\| Select-String -Pattern 'inventory_check_total\\|inventory_reserved_total\\|inventory_shortage_total'\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

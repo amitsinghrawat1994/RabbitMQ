@@ -21,7 +21,6 @@ namespace PaymentService
             var amount = context.Message.Amount;
 
             _logger.LogInformation("Processing payment for Order: {OrderId}, Amount: {Amount}", orderId, amount);
-
             var guidString = orderId;
 
             // 1. Logic: Hard Fail

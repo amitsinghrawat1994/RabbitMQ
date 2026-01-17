@@ -1,0 +1,57 @@
+11-01-2026
+
+Now for all the Scenario not wokring means there is not any entires in sqllite db and no success message in queue
+but there are multple error message for Queue OrderState_error  queue. might be some miss configuration
+
+
+
+ Responding with gemini-3-pro-preview
+✦ Here is your guide to starting and debugging this distributed .NET 10 application.
+
+  1. Prerequisites: RabbitMQ
+  This system relies on RabbitMQ for message passing between services. You must have it running before starting the apps.
+
+   * Start RabbitMQ:
+   1     docker-compose up -d
+   * Verify: Open http://localhost:15672 (http://localhost:15672) (Username: guest, Password: guest). If the dashboard loads, you are ready.
+
+  2. Debugging with VS Code (Recommended)
+  Your project is already configured for full-stack debugging in VS Code.
+
+   1. Open the Run and Debug view (Ctrl+Shift+D).
+   2. Select "All Services" from the dropdown menu (this is defined in your .vscode/launch.json and runs all 3 services together).
+   3. Press F5 (Start Debugging).
+       * This will launch OrderService, InventoryService, and PaymentService simultaneously.
+       * A browser window should open to the OrderService Swagger UI (http://localhost:5085/swagger).
+   4. Set Breakpoints: You can now set breakpoints in any of the three projects (e.g., inside OrderStateMachine.cs, CheckInventoryConsumer.cs, or
+      ProcessPaymentConsumer.cs) and hit them with a single request.
+
+  3. Running via CLI
+  If you prefer running them manually in the terminal, you will need 3 separate terminal windows:
+
+  Terminal 1 (Order API):
+   1 dotnet run --project OrderService
+
+  Terminal 2 (Inventory Worker):
+   1 dotnet run --project InventoryService
+
+  Terminal 3 (Payment Worker):
+   1 dotnet run --project PaymentService
+  4. How to Test & Simulate Scenarios
+  The system uses the last digit of the Customer Number (simulated as ID logic) or specific scenarios to trigger different outcomes.
+
+  Use the Swagger UI (http://localhost:5085/swagger) to POST to /Order.
+
+
+  ┌─────────────────┬─────────────────────────────────────┬─────────────────────────────┐
+  │ Scenario        │ Request Data Suggestion             │ Result                      │
+  ├─────────────────┼─────────────────────────────────────┼─────────────────────────────┤
+  │ Happy Path      │ CustomerNumber: "12345"             │ Completed                   │
+  │ Stock Failure   │ CustomerNumber: "....0" (Ends in 0) │ Failed (Inventory Rejected) │
+  │ Payment Failure │ CustomerNumber: "....1" (Ends in 1) │ Failed (Payment Rejected)   │
+  │ Transient Error │ CustomerNumber: "....2" (Ends in 2) │ Retries then DLQ            │
+  └─────────────────┴─────────────────────────────────────┴─────────────────────────────┘
+
+  Example Command (Happy Path):
+
+   1 Invoke-RestMethod -Method Post -Uri "http://localhost:5085/Order" -ContentType "application/json" -Body '{"customerNumber": "12345", "totalAmount": 100.00}'   

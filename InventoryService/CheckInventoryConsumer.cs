@@ -34,7 +34,6 @@ namespace InventoryService
             if (guidString.EndsWith("0"))
             {
                 _logger.LogWarning("Stock shortage for Order: {OrderId}", orderId);
-
                 await context.Publish<StockShortage>(new
                 {
                     OrderId = orderId,
@@ -44,7 +43,6 @@ namespace InventoryService
             else
             {
                 _logger.LogInformation("Stock reserved for Order: {OrderId}", orderId);
-
                 await context.Publish<StockReserved>(new
                 {
                     OrderId = orderId

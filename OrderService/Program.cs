@@ -2,6 +2,7 @@ using Contracts;
 using MassTransit;
 using Microsoft.EntityFrameworkCore;
 using OrderService.Sagas;
+using OrderService;
 using OpenTelemetry.Trace;
 using OpenTelemetry.Resources;
 
@@ -51,6 +52,10 @@ builder.Services.AddMassTransit(x =>
             // As an additional safety net, allow customizing the EF query if needed (keeps default behavior otherwise)
             r.CustomizeQuery(query => query);
         });
+
+    // Register lightweight consumers to persist final order outcomes for audit/status lookup
+    x.AddConsumer<OrderCompletedConsumer>();
+    x.AddConsumer<OrderFailedConsumer>();
 
     x.UsingRabbitMq((context, cfg) =>
     {
