@@ -66,6 +66,9 @@ builder.Services.AddMassTransit(x =>
             h.Password(rabbitConfig["Password"] ?? "guest");
         });
 
+        // Use Delay-Based Message Scheduler (built into RabbitMQ transport for delays up to 1 day)
+        cfg.UseDelayedMessageScheduler();
+
         // Configure endpoints for Sagas
         cfg.ConfigureEndpoints(context);
     });

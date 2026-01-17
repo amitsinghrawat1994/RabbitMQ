@@ -1,0 +1,533 @@
+---
+title: "Building Distributed Sagas - Part 6: Error Handling, Retries & Dead Letter Queues"
+date: "2026-01-17"
+excerpt: "Master resilience patterns in distributed systems with MassTransit retry policies, circuit breakers, dead letter queues, and compensating transactions."
+tags: ["error-handling", "resilience", "retry", "dlq", "masstransit", "distributed-systems"]
+status: "published"
+series: "Building Distributed Sagas with RabbitMQ & MassTransit"
+seriesOrder: 6
+---
+
+# Part 6: Error Handling, Retries & Dead Letter Queues
+
+In distributed systems, **failures are inevitable**. Network issues, service outages, and transient errors happen constantly. The difference between a fragile system and a resilient one is how errors are handled. In this part, we'll explore MassTransit's powerful error handling capabilities.
+
+## Types of Failures
+
+Understanding failure types is critical for choosing the right strategy:
+
+| Failure Type | Example | Strategy |
+|--------------|---------|----------|
+| **Transient** | Network timeout, database deadlock | **Retry** with backoff |
+| **Permanent** | Invalid data, business rule violation | **Fail fast**, don't retry |
+| **Partial** | 2 of 3 services succeed | **Compensate** completed actions |
+| **Timeout** | Long-running operation | **Circuit breaker** |
+
+## MassTransit Retry Policies
+
+### 1. Immediate Retry
+
+Retries immediately without delay (use for very brief transient errors):
+
+```csharp
+cfg.UseMessageRetry(r => r.Immediate(3));
+```
+
+**When to use**: Database deadlocks, brief connection issues
+
+### 2. Interval Retry
+
+Retries with fixed delay between attempts:
+
+```csharp
+cfg.UseMessageRetry(r => r.Interval(5, TimeSpan.FromSeconds(2)));
+// Retry 5 times, wait 2 seconds between each
+```
+
+**When to use**: API rate limits, service warm-up
+
+### 3. Exponential Backoff
+
+Retries with increasing delays (recommended for most scenarios):
+
+```csharp
+cfg.UseMessageRetry(r => r.Exponential(
+    retryLimit: 5,
+    minInterval: TimeSpan.FromSeconds(1),
+    maxInterval: TimeSpan.FromSeconds(30),
+    intervalDelta: TimeSpan.FromSeconds(2)
+));
+```
+
+**Retry Schedule:**
+- Attempt 1: Immediate
+- Attempt 2: 1s delay
+- Attempt 3: 3s delay (1s + 2s)
+- Attempt 4: 5s delay (3s + 2s)
+- Attempt 5: 7s delay (5s + 2s)
+
+**When to use**: External API calls, transient network issues
+
+### 4. Incremental Retry
+
+Linear increase in delay:
+
+```csharp
+cfg.UseMessageRetry(r => r.Incremental(
+    retryLimit: 10,
+    initialInterval: TimeSpan.FromSeconds(1),
+    intervalIncrement: TimeSpan.FromSeconds(2)
+));
+```
+
+**Retry Schedule:**
+- Attempt 1: 1s
+- Attempt 2: 3s (1s + 2s)
+- Attempt 3: 5s (3s + 2s)
+- Attempt 4: 7s (5s + 2s)
+
+## Configuring Retries in Our System
+
+### Global Retry Policy (All Consumers)
+
+```csharp
+// Program.cs
+builder.Services.AddMassTransit(x =>
+{
+    x.AddConsumer<ProcessPaymentConsumer>();
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host("localhost");
+
+        // ─────────────────────────────────────────────────────────
+        // GLOBAL RETRY POLICY
+        // ─────────────────────────────────────────────────────────
+        cfg.UseMessageRetry(r => r.Exponential(
+            retryLimit: 3,
+            minInterval: TimeSpan.FromMilliseconds(100),
+            maxInterval: TimeSpan.FromSeconds(10),
+            intervalDelta: TimeSpan.FromMilliseconds(500)
+        ));
+
+        cfg.ConfigureEndpoints(context);
+    });
+});
+```
+
+### Per-Consumer Retry Policy
+
+```csharp
+cfg.ReceiveEndpoint("payment-service", e =>
+{
+    // Override global policy for this specific consumer
+    e.UseMessageRetry(r => r.Immediate(5));
+    
+    e.ConfigureConsumer<ProcessPaymentConsumer>(context);
+});
+```
+
+### Retry with Exception Filtering
+
+Only retry specific exception types:
+
+```csharp
+cfg.UseMessageRetry(r => r
+    .Exponential(5, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(2))
+    .Ignore<ArgumentNullException>()  // Don't retry
+    .Ignore<ValidationException>()    // Don't retry
+    .Handle<HttpRequestException>()   // Only retry these
+    .Handle<TimeoutException>()
+);
+```
+
+**Example Consumer:**
+
+```csharp
+public class ProcessPaymentConsumer : IConsumer<ProcessPayment>
+{
+    public async Task Consume(ConsumeContext<ProcessPayment> context)
+    {
+        try
+        {
+            await _gateway.ChargeAsync(context.Message);
+        }
+        catch (PaymentDeclinedException ex)
+        {
+            // Permanent failure - don't retry
+            throw new ValidationException("Card declined", ex);
+        }
+        catch (HttpRequestException ex)
+        {
+            // Transient failure - will retry
+            throw;
+        }
+    }
+}
+```
+
+## Dead Letter Queues (DLQ)
+
+When all retries are exhausted, MassTransit moves messages to an error queue.
+
+### Automatic DLQ Configuration
+
+```csharp
+cfg.ReceiveEndpoint("payment-service", e =>
+{
+    // After retries exhausted, message goes to "payment-service_error"
+    e.ConfigureConsumer<ProcessPaymentConsumer>(context);
+});
+```
+
+**Queue Naming Convention:**
+- Normal queue: `payment-service`
+- Error queue: `payment-service_error`
+- Skipped queue: `payment-service_skipped`
+
+### Inspecting Failed Messages
+
+1. Go to [http://localhost:15672/#/queues](http://localhost:15672/#/queues)
+2. Click on `payment-service_error`
+3. Scroll to "Get messages" → Click "Get Message(s)"
+
+**Message Headers Include:**
+- `MT-Fault-Message`: Original message
+- `MT-Fault-Timestamp`: When it failed
+- `MT-Fault-Exception`: Exception details
+- `MT-Fault-StackTrace`: Full stack trace
+
+### Reprocessing Failed Messages
+
+#### Option 1: Manual Republish (via RabbitMQ UI)
+
+1. Get message from `payment-service_error`
+2. Copy payload
+3. Go to `Contracts:ProcessPayment` exchange
+4. Publish message
+
+#### Option 2: Programmatic Republish
+
+```csharp
+// Admin tool to republish DLQ messages
+public class DlqReprocessor
+{
+    private readonly IBus _bus;
+
+    public async Task ReprocessFailedPayments()
+    {
+        // Read from payment-service_error queue
+        var failedMessages = await GetFailedMessagesAsync("payment-service_error");
+        
+        foreach (var msg in failedMessages)
+        {
+            await _bus.Publish<ProcessPayment>(msg);
+        }
+    }
+}
+```
+
+#### Option 3: Automated Retry with Scheduled Redelivery
+
+```csharp
+cfg.ReceiveEndpoint("payment-service_error", e =>
+{
+    e.Consumer<FaultConsumer>();
+});
+
+public class FaultConsumer : IConsumer<Fault<ProcessPayment>>
+{
+    public async Task Consume(ConsumeContext<Fault<ProcessPayment>> context)
+    {
+        var originalMessage = context.Message.Message;
+        
+        // Wait 1 hour, then retry
+        await context.SchedulePublish(
+            TimeSpan.FromHours(1),
+            originalMessage
+        );
+    }
+}
+```
+
+## Circuit Breaker Pattern
+
+Prevent cascading failures by "opening the circuit" when a service is down.
+
+```csharp
+builder.Services.AddMassTransit(x =>
+{
+    x.AddConsumer<ProcessPaymentConsumer>();
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        cfg.Host("localhost");
+
+        // ─────────────────────────────────────────────────────────
+        // CIRCUIT BREAKER
+        // ─────────────────────────────────────────────────────────
+        cfg.UseCircuitBreaker(cb =>
+        {
+            cb.TrackingPeriod = TimeSpan.FromMinutes(1);
+            cb.TripThreshold = 15;  // Open after 15 failures in 1 minute
+            cb.ActiveThreshold = 10; // Half-open after 10 successful messages
+            cb.ResetInterval = TimeSpan.FromMinutes(5); // Try closing after 5 min
+        });
+
+        cfg.ConfigureEndpoints(context);
+    });
+});
+```
+
+**States:**
+- **Closed**: Normal operation
+- **Open**: Circuit tripped, messages immediately fail (skip retries)
+- **Half-Open**: Testing if service recovered
+
+## Rate Limiting
+
+Prevent overwhelming downstream services:
+
+```csharp
+cfg.UseRateLimit(1000, TimeSpan.FromSeconds(1)); // Max 1000 msg/sec
+```
+
+**Or per-consumer:**
+
+```csharp
+cfg.ReceiveEndpoint("payment-service", e =>
+{
+    e.UseRateLimit(100, TimeSpan.FromSeconds(1)); // Max 100 msg/sec
+    e.ConfigureConsumer<ProcessPaymentConsumer>(context);
+});
+```
+
+## Compensating Transactions
+
+When a saga fails mid-process, we need to undo completed actions.
+
+### Example: Release Inventory on Payment Failure
+
+```csharp
+// OrderStateMachine.cs
+During(InventoryReserved,
+    When(PaymentFailed)
+        .Then(context => context.Saga.Updated = DateTime.UtcNow)
+        .TransitionTo(Failed)
+        // ─────────────────────────────────────────────────────────
+        // COMPENSATING ACTION
+        // ─────────────────────────────────────────────────────────
+        .PublishAsync(context => context.Init<ReleaseInventory>(new
+        {
+            OrderId = context.Saga.OrderId
+        }))
+        .PublishAsync(context => context.Init<OrderFailed>(new
+        {
+            OrderId = context.Saga.OrderId,
+            Reason = context.Message.Reason
+        }))
+);
+```
+
+### Inventory Release Consumer
+
+```csharp
+public class ReleaseInventoryConsumer : IConsumer<ReleaseInventory>
+{
+    public async Task Consume(ConsumeContext<ReleaseInventory> context)
+    {
+        var orderId = context.Message.OrderId;
+        
+        _logger.LogInformation("Releasing inventory for Order: {OrderId}", orderId);
+        
+        // Unreserve stock in database
+        await _repository.ReleaseStockAsync(orderId);
+        
+        await context.Publish<InventoryReleased>(new
+        {
+            OrderId = orderId
+        });
+    }
+}
+```
+
+## Timeout Handling
+
+Set time limits on message processing:
+
+```csharp
+cfg.ReceiveEndpoint("payment-service", e =>
+{
+    e.ConfigureConsumer<ProcessPaymentConsumer>(context);
+    
+    // Message must complete within 30 seconds
+    e.UseTimeout(x => x.Timeout = TimeSpan.FromSeconds(30));
+});
+```
+
+**What happens on timeout?**
+- Exception thrown
+- Retry policy applies
+- After retries → DLQ
+
+## Fault Message Handling
+
+Automatically generated when consumer throws exception:
+
+```csharp
+// Consumer throws exception
+public class ProcessPaymentConsumer : IConsumer<ProcessPayment>
+{
+    public async Task Consume(ConsumeContext<ProcessPayment> context)
+    {
+        throw new Exception("Payment gateway down");
+    }
+}
+
+// MassTransit automatically publishes Fault<ProcessPayment>
+public class PaymentFaultConsumer : IConsumer<Fault<ProcessPayment>>
+{
+    public async Task Consume(ConsumeContext<Fault<ProcessPayment>> context)
+    {
+        var originalMessage = context.Message.Message;
+        var exceptions = context.Message.Exceptions;
+        
+        _logger.LogError(
+            "Payment failed for Order: {OrderId}, Exception: {Exception}",
+            originalMessage.OrderId,
+            exceptions.FirstOrDefault()?.Message
+        );
+        
+        // Send alert, log to Sentry, etc.
+    }
+}
+```
+
+## Testing Error Scenarios
+
+### Test Retry Behavior
+
+```csharp
+[Fact]
+public async Task Should_Retry_Three_Times_Before_DLQ()
+{
+    var attemptCount = 0;
+
+    await using var provider = new ServiceCollection()
+        .AddMassTransitTestHarness(cfg =>
+        {
+            cfg.AddConsumer<PaymentConsumer>(c =>
+            {
+                c.UseMessageRetry(r => r.Immediate(3));
+            });
+        })
+        .BuildServiceProvider(true);
+
+    var harness = provider.GetRequiredService<ITestHarness>();
+    await harness.Start();
+
+    // Consumer will throw every time
+    var consumerHarness = harness.GetConsumerHarness<PaymentConsumer>();
+    
+    await harness.Bus.Publish<ProcessPayment>(new
+    {
+        OrderId = "test-123",
+        Amount = 99.99m
+    });
+
+    // Verify 4 attempts (1 original + 3 retries)
+    Assert.True(await consumerHarness.Consumed.Any<ProcessPayment>());
+    // In real RabbitMQ, check DLQ for message
+}
+```
+
+## Monitoring & Alerts
+
+### Log Structured Errors
+
+```csharp
+public async Task Consume(ConsumeContext<ProcessPayment> context)
+{
+    try
+    {
+        await _gateway.ChargeAsync(context.Message);
+    }
+    catch (Exception ex)
+    {
+        _logger.LogError(ex,
+            "Payment processing failed: {OrderId}, {Amount}, {Attempt}, {MessageId}",
+            context.Message.OrderId,
+            context.Message.Amount,
+            context.GetRetryAttempt(),
+            context.MessageId
+        );
+        throw;
+    }
+}
+```
+
+### Metrics with Custom Headers
+
+```csharp
+await context.Publish<PaymentFailed>(new
+{
+    OrderId = orderId,
+    Reason = "Declined"
+}, ctx =>
+{
+    ctx.Headers.Set("Failure-Type", "Permanent");
+    ctx.Headers.Set("Error-Code", "CARD_DECLINED");
+});
+```
+
+## Best Practices Summary
+
+### ✅ DO
+
+- **Retry transient errors** (network, timeouts)
+- **Use exponential backoff** to avoid overwhelming services
+- **Filter exceptions** - don't retry validation errors
+- **Monitor DLQ size** - alert when messages accumulate
+- **Log with correlation IDs** for tracing
+- **Implement compensating transactions** for saga failures
+- **Test error scenarios** explicitly
+
+### ❌ DON'T
+
+- **Retry permanent errors** (validation, business rules)
+- **Retry indefinitely** - use reasonable limits (3-10 retries)
+- **Ignore DLQ messages** - they need attention
+- **Swallow exceptions** - let MassTransit handle retries
+- **Block in retry logic** - use async delays
+
+## Error Handling Checklist
+
+Before going to production, verify:
+
+- [ ] Retry policies configured for all consumers
+- [ ] Exception filtering prevents retry of permanent errors
+- [ ] Circuit breaker configured for critical dependencies
+- [ ] DLQ monitoring/alerting in place
+- [ ] Compensating transactions tested
+- [ ] Timeout policies set for long-running operations
+- [ ] Structured logging includes correlation IDs
+- [ ] Load testing validates retry behavior under stress
+
+## Key Takeaways
+
+✅ **Failures are normal** in distributed systems  
+✅ **Retry transient errors** with exponential backoff  
+✅ **Fail fast** on permanent errors (validation, business rules)  
+✅ **DLQs capture** messages that can't be processed  
+✅ **Circuit breakers** prevent cascading failures  
+✅ **Compensating transactions** undo partial work  
+✅ **Monitor and alert** on DLQ accumulation  
+
+## Next Steps
+
+In **Part 7**, we'll explore comprehensive testing strategies with MassTransit TestHarness, including unit tests, integration tests, and saga testing.
+
+---
+
+**Previous**: [← Part 5 - Microservices Consumers](./part-5-microservices-consumers.mdx)  
+**Next**: [Part 7 - Testing with MassTransit TestHarness →](./part-7-testing-strategies.mdx)

@@ -8,6 +8,13 @@ namespace OrderService.Sagas
     {
         public OrderStateMachine()
         {
+            // Configure timeout schedule (5-minute timeout for order processing)
+            Schedule(() => OrderTimeout, instance => instance.TimeoutTokenId, s =>
+            {
+                s.Delay = TimeSpan.FromMinutes(5);
+                s.Received = r => r.CorrelateBy((saga, context) => saga.OrderId == context.Message.OrderId);
+            });
+
             // correlate events to the saga instance (messages carry string OrderId — correlate by saga.OrderId)
             Event(() => OrderSubmitted, x => x.CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId)
                 .SelectId(context => Guid.NewGuid()));
@@ -31,6 +38,7 @@ namespace OrderService.Sagas
                         context.Saga.TotalAmount = context.Message.TotalAmount;
                     })
                     .TransitionTo(Submitted)
+                    .Schedule(OrderTimeout, context => context.Init<OrderTimeoutExpired>(new { OrderId = context.Saga.OrderId }))
                     // Use PublishAsync with Init for clean interface publishing
                     .PublishAsync(context => context.Init<CheckInventory>(new
                     {
@@ -41,7 +49,9 @@ namespace OrderService.Sagas
             During(Submitted,
                 When(StockReserved)
                     .Then(context => context.Saga.Updated = DateTime.UtcNow)
+                    .Unschedule(OrderTimeout)
                     .TransitionTo(InventoryReserved)
+                    .Schedule(OrderTimeout, context => context.Init<OrderTimeoutExpired>(new { OrderId = context.Saga.OrderId }))
                     .PublishAsync(context => context.Init<ProcessPayment>(new
                     {
                         OrderId = context.Saga.OrderId,
@@ -52,17 +62,28 @@ namespace OrderService.Sagas
 
                 When(StockShortage)
                     .Then(context => context.Saga.Updated = DateTime.UtcNow)
+                    .Unschedule(OrderTimeout)
                     .TransitionTo(Failed)
                     .PublishAsync(context => context.Init<OrderFailed>(new
                     {
                         OrderId = context.Saga.OrderId,
                         Reason = context.Message.Reason
+                    })),
+
+                When(OrderTimeout.Received)
+                    .Then(context => context.Saga.Updated = DateTime.UtcNow)
+                    .TransitionTo(Failed)
+                    .PublishAsync(context => context.Init<OrderFailed>(new
+                    {
+                        OrderId = context.Saga.OrderId,
+                        Reason = "Order processing timeout - no response from inventory service within 5 minutes"
                     }))
             );
 
             During(InventoryReserved,
                 When(PaymentAccepted)
                     .Then(context => context.Saga.Updated = DateTime.UtcNow)
+                    .Unschedule(OrderTimeout)
                     .TransitionTo(Completed)
                     .PublishAsync(context => context.Init<OrderCompleted>(new
                     {
@@ -73,11 +94,21 @@ namespace OrderService.Sagas
 
                 When(PaymentFailed)
                     .Then(context => context.Saga.Updated = DateTime.UtcNow)
+                    .Unschedule(OrderTimeout)
                     .TransitionTo(Failed)
                     .PublishAsync(context => context.Init<OrderFailed>(new
                     {
                         OrderId = context.Saga.OrderId,
                         Reason = context.Message.Reason
+                    })),
+
+                When(OrderTimeout.Received)
+                    .Then(context => context.Saga.Updated = DateTime.UtcNow)
+                    .TransitionTo(Failed)
+                    .PublishAsync(context => context.Init<OrderFailed>(new
+                    {
+                        OrderId = context.Saga.OrderId,
+                        Reason = "Order processing timeout - no response from payment service within 5 minutes"
                     }))
             );
 
@@ -94,5 +125,7 @@ namespace OrderService.Sagas
         public Event<StockShortage> StockShortage { get; private set; } = null!;
         public Event<PaymentAccepted> PaymentAccepted { get; private set; } = null!;
         public Event<PaymentFailed> PaymentFailed { get; private set; } = null!;
+
+        public Schedule<OrderState, OrderTimeoutExpired> OrderTimeout { get; private set; } = null!;
     }
 }

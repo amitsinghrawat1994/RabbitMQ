@@ -7,6 +7,7 @@ using OrderService.Models;
 using Microsoft.EntityFrameworkCore;
 using OrderService.Sagas;
 using System.ComponentModel.DataAnnotations;
+using Microsoft.Extensions.Logging;
 
 namespace OrderService.Controllers
 {
@@ -16,11 +17,13 @@ namespace OrderService.Controllers
     {
         private readonly IPublishEndpoint _publishEndpoint;
         private readonly OrderDbContext _db;
+        private readonly ILogger<OrderController> _logger;
 
-        public OrderController(IPublishEndpoint publishEndpoint, OrderDbContext db)
+        public OrderController(IPublishEndpoint publishEndpoint, OrderDbContext db, ILogger<OrderController> logger)
         {
             _publishEndpoint = publishEndpoint;
             _db = db;
+            _logger = logger;
         }
 
         [HttpPost]
@@ -41,15 +44,28 @@ namespace OrderService.Controllers
 
             var orderId = request.OrderId ?? Guid.NewGuid().ToString();
 
-            await _publishEndpoint.Publish<OrderSubmitted>(new
+            try
             {
-                OrderId = orderId,
-                Timestamp = DateTime.UtcNow,
-                CustomerNumber = request.CustomerNumber,
-                TotalAmount = request.TotalAmount
-            });
+                await _publishEndpoint.Publish<OrderSubmitted>(new
+                {
+                    OrderId = orderId,
+                    Timestamp = DateTime.UtcNow,
+                    CustomerNumber = request.CustomerNumber,
+                    TotalAmount = request.TotalAmount
+                });
 
-            return Accepted(new { OrderId = orderId });
+                _logger.LogInformation("Order submitted successfully. OrderId: {OrderId}, CustomerNumber: {CustomerNumber}, Amount: {Amount}",
+                    orderId, request.CustomerNumber, request.TotalAmount);
+
+                return Accepted(new { OrderId = orderId });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to submit order. OrderId: {OrderId}, CustomerNumber: {CustomerNumber}",
+                    orderId, request.CustomerNumber);
+
+                return StatusCode(503, new { error = "Service unavailable. Please try again later." });
+            }
         }
 
         [HttpGet("{orderId}")]

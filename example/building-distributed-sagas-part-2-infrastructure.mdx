@@ -1,0 +1,505 @@
+---
+title: "Building Distributed Sagas - Part 2: Infrastructure Setup with Docker & RabbitMQ"
+date: "2026-01-17"
+excerpt: "Set up a complete local development environment with RabbitMQ, Jaeger, and OpenTelemetry Collector using Docker Compose for building distributed microservices."
+tags: ["rabbitmq", "docker", "jaeger", "opentelemetry", "infrastructure", "devops"]
+status: "published"
+series: "Building Distributed Sagas with RabbitMQ & MassTransit"
+seriesOrder: 2
+---
+
+# Part 2: Infrastructure Setup with Docker & RabbitMQ
+
+Before writing any code, we need a robust local development environment. In this part, we'll set up RabbitMQ, Jaeger for distributed tracing, and the OpenTelemetry Collector—all orchestrated with Docker Compose.
+
+## Why Docker for Local Development?
+
+**Benefits:**
+- ✅ **Consistency**: Same environment on every developer's machine
+- ✅ **Isolation**: No conflicts with other projects
+- ✅ **Speed**: Start/stop entire stack in seconds
+- ✅ **Production Parity**: Mirror production infrastructure locally
+
+## Infrastructure Components
+
+### 1. RabbitMQ (Message Broker)
+- **Purpose**: Message routing, queuing, and delivery
+- **Management UI**: Web-based queue/exchange monitoring
+- **Port 5672**: AMQP protocol (service communication)
+- **Port 15672**: Management UI
+
+### 2. Jaeger (Distributed Tracing)
+- **Purpose**: Visualize request flows across services
+- **OpenTelemetry**: Native OTLP support
+- **Port 16686**: Jaeger UI
+
+### 3. OpenTelemetry Collector
+- **Purpose**: Centralize trace collection
+- **Port 4317**: OTLP gRPC endpoint (apps send here)
+- **Port 4318**: OTLP HTTP endpoint
+
+## Docker Compose Configuration
+
+Create `docker-compose.yml` in your project root:
+
+```yaml
+version: '3.8'
+
+services:
+  # RabbitMQ - Message Broker
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"    # AMQP protocol
+      - "15672:15672"  # Management UI
+    environment:
+      - RABBITMQ_DEFAULT_USER=guest
+      - RABBITMQ_DEFAULT_PASS=guest
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Jaeger - Distributed Tracing Backend
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14268:14268"  # Jaeger collector HTTP
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  # OpenTelemetry Collector - Trace Aggregation
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel/config.yaml"]
+    ports:
+      - "4317:4317"    # OTLP gRPC (apps send here)
+      - "4318:4318"    # OTLP HTTP
+      - "8888:8888"    # Prometheus metrics (collector itself)
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel/config.yaml
+    depends_on:
+      - jaeger
+
+volumes:
+  rabbitmq_data:
+    driver: local
+```
+
+### OpenTelemetry Collector Configuration
+
+Create `otel-collector-config.yaml`:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+exporters:
+  # Export traces to Jaeger
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Log traces to console (debugging)
+  logging:
+    loglevel: debug
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, logging]
+```
+
+## Starting the Infrastructure
+
+### Step 1: Start Services
+
+```powershell
+# Start all services in detached mode
+docker-compose up -d
+
+# Verify all containers are running
+docker-compose ps
+
+# Expected output:
+# NAME            STATUS    PORTS
+# rabbitmq        Up        0.0.0.0:5672->5672/tcp, 0.0.0.0:15672->15672/tcp
+# jaeger          Up        0.0.0.0:16686->16686/tcp
+# otel-collector  Up        0.0.0.0:4317->4317/tcp, 0.0.0.0:4318->4318/tcp
+```
+
+### Step 2: Verify RabbitMQ
+
+Open [http://localhost:15672](http://localhost:15672) in your browser:
+- **Username**: `guest`
+- **Password**: `guest`
+
+You should see the RabbitMQ Management Dashboard with:
+- **Overview**: Connection stats, message rates
+- **Queues**: List of queues (empty for now)
+- **Exchanges**: Default exchanges (`amq.direct`, `amq.topic`, etc.)
+
+### Step 3: Verify Jaeger
+
+Open [http://localhost:16686](http://localhost:16686):
+- Should see the Jaeger UI
+- No traces yet (we'll add them in Part 8)
+
+### Step 4: Check Logs
+
+```powershell
+# View RabbitMQ logs
+docker-compose logs rabbitmq
+
+# View OTEL Collector logs
+docker-compose logs otel-collector
+
+# Follow logs in real-time
+docker-compose logs -f
+```
+
+## Understanding RabbitMQ Concepts
+
+### Exchanges, Queues, and Bindings
+
+RabbitMQ routing is based on these core concepts:
+
+```
+Publisher → [Exchange] → [Binding] → [Queue] → Consumer
+```
+
+#### 1. Exchanges (Routing Logic)
+Exchanges receive messages and route them to queues based on bindings.
+
+| Type | Routing Behavior | Use Case |
+|------|-----------------|----------|
+| **Direct** | Exact routing key match | Point-to-point commands |
+| **Topic** | Pattern matching (`order.*`, `*.created`) | Event categories |
+| **Fanout** | Broadcast to all queues | Notifications to all services |
+| **Headers** | Match message headers | Complex routing rules |
+
+**MassTransit Default**: Topic exchanges for events, direct for commands.
+
+#### 2. Queues (Message Storage)
+- FIFO by default (except with priorities)
+- Durable (survive broker restart) or transient
+- Exclusive (single consumer) or shared
+
+#### 3. Bindings (Routing Rules)
+- Connect exchanges to queues with routing keys
+- Example: Exchange `order-events` → Binding `order.created` → Queue `inventory-service`
+
+### MassTransit Conventions
+
+MassTransit creates exchanges and queues automatically:
+
+```
+Message Type              Exchange Name                  Queue Name
+─────────────────────────────────────────────────────────────────────────
+OrderSubmitted (event)    Contracts:OrderSubmitted       order-service
+CheckInventory (command)  Contracts:CheckInventory       inventory-service
+StockReserved (event)     Contracts:StockReserved        order-service
+ProcessPayment (command)  Contracts:ProcessPayment       payment-service
+```
+
+**Convention**: `Namespace:MessageType`
+
+### Dead Letter Queues (DLQ)
+
+When a message fails after all retries, RabbitMQ moves it to a DLQ:
+
+```
+Normal Queue              Dead Letter Queue
+─────────────────────────────────────────────
+inventory-service      → inventory-service_error
+payment-service        → payment-service_error
+```
+
+**Inspect Failed Messages**: Go to RabbitMQ UI → Queues → `{queue}_error`
+
+## Debugging Infrastructure Issues
+
+### Issue 1: RabbitMQ Container Won't Start
+
+**Symptom**: `docker-compose ps` shows RabbitMQ as `Restarting`
+
+**Solution**:
+```powershell
+# Check logs
+docker-compose logs rabbitmq
+
+# Common fix: Port 5672 already in use
+# Stop conflicting service or change port in docker-compose.yml
+netstat -ano | findstr :5672
+
+# Clean restart
+docker-compose down -v
+docker-compose up -d
+```
+
+### Issue 2: Can't Access Management UI
+
+**Symptom**: `localhost:15672` times out
+
+**Solution**:
+```powershell
+# Verify port binding
+docker-compose ps
+
+# If port is bound but still can't access:
+# Check Windows Firewall
+# Try 127.0.0.1:15672 instead of localhost:15672
+```
+
+### Issue 3: OTEL Collector Not Receiving Traces
+
+**Symptom**: Jaeger UI shows no traces
+
+**Solution**:
+```powershell
+# Verify OTEL collector is running
+docker-compose logs otel-collector
+
+# Test connectivity from host
+curl -X POST http://localhost:4318/v1/traces \
+  -H "Content-Type: application/json" \
+  -d '{"resourceSpans":[]}'
+
+# Should return 200 OK
+```
+
+## VS Code Debugging Configuration
+
+Create `.vscode/launch.json` to run all services together:
+
+```json
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "OrderService",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build-order",
+      "program": "${workspaceFolder}/OrderService/bin/Debug/net10.0/OrderService.dll",
+      "args": [],
+      "cwd": "${workspaceFolder}/OrderService",
+      "stopAtEntry": false,
+      "serverReadyAction": {
+        "action": "openExternally",
+        "pattern": "\\bNow listening on:\\s+(https?://\\S+)",
+        "uriFormat": "%s/swagger"
+      },
+      "env": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      }
+    },
+    {
+      "name": "InventoryService",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build-inventory",
+      "program": "${workspaceFolder}/InventoryService/bin/Debug/net10.0/InventoryService.dll",
+      "args": [],
+      "cwd": "${workspaceFolder}/InventoryService",
+      "stopAtEntry": false
+    },
+    {
+      "name": "PaymentService",
+      "type": "coreclr",
+      "request": "launch",
+      "preLaunchTask": "build-payment",
+      "program": "${workspaceFolder}/PaymentService/bin/Debug/net10.0/PaymentService.dll",
+      "args": [],
+      "cwd": "${workspaceFolder}/PaymentService",
+      "stopAtEntry": false
+    }
+  ],
+  "compounds": [
+    {
+      "name": "All Services",
+      "configurations": ["OrderService", "InventoryService", "PaymentService"],
+      "stopAll": true
+    }
+  ]
+}
+```
+
+Create `.vscode/tasks.json`:
+
+```json
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "kill-services",
+      "type": "shell",
+      "command": "powershell",
+      "args": [
+        "-Command",
+        "Get-Process -Name OrderService,InventoryService,PaymentService -ErrorAction SilentlyContinue | Stop-Process -Force; exit 0"
+      ]
+    },
+    {
+      "label": "build-order",
+      "command": "dotnet",
+      "type": "process",
+      "dependsOn": "kill-services",
+      "args": [
+        "build",
+        "${workspaceFolder}/OrderService/OrderService.csproj",
+        "/property:GenerateFullPaths=true",
+        "/consoleloggerparameters:NoSummary"
+      ]
+    },
+    {
+      "label": "build-inventory",
+      "command": "dotnet",
+      "type": "process",
+      "dependsOn": "kill-services",
+      "args": [
+        "build",
+        "${workspaceFolder}/InventoryService/InventoryService.csproj",
+        "/property:GenerateFullPaths=true",
+        "/consoleloggerparameters:NoSummary"
+      ]
+    },
+    {
+      "label": "build-payment",
+      "command": "dotnet",
+      "type": "process",
+      "dependsOn": "kill-services",
+      "args": [
+        "build",
+        "${workspaceFolder}/PaymentService/PaymentService.csproj",
+        "/property:GenerateFullPaths=true",
+        "/consoleloggerparameters:NoSummary"
+      ]
+    }
+  ]
+}
+```
+
+**Usage**:
+1. Press `F5` in VS Code
+2. Select **"All Services"** from dropdown
+3. All three services start simultaneously
+4. Swagger UI opens automatically for OrderService
+
+## Infrastructure Checklist
+
+Before moving to Part 3, verify:
+
+- [ ] RabbitMQ Management UI accessible at [http://localhost:15672](http://localhost:15672)
+- [ ] Jaeger UI accessible at [http://localhost:16686](http://localhost:16686)
+- [ ] OTEL Collector logs show no errors (`docker-compose logs otel-collector`)
+- [ ] VS Code launch configuration works (`F5` → "All Services")
+- [ ] RabbitMQ shows default exchanges (amq.*)
+
+## Useful Commands
+
+```powershell
+# Infrastructure management
+docker-compose up -d              # Start all services
+docker-compose down               # Stop all services
+docker-compose down -v            # Stop and remove volumes (clean slate)
+docker-compose restart rabbitmq   # Restart single service
+docker-compose logs -f rabbitmq   # Follow logs
+
+# RabbitMQ management
+docker exec rabbitmq rabbitmqctl list_queues
+docker exec rabbitmq rabbitmqctl list_exchanges
+docker exec rabbitmq rabbitmqctl list_bindings
+
+# Cleanup (nuclear option)
+docker-compose down -v --rmi all  # Remove everything including images
+```
+
+## Common RabbitMQ Management Tasks
+
+### View Queue Details
+1. Go to [http://localhost:15672/#/queues](http://localhost:15672/#/queues)
+2. Click on a queue name
+3. See message rates, ready messages, unacked messages
+
+### Purge a Queue (Clear Messages)
+1. Go to queue details
+2. Scroll to "Purge" section
+3. Click "Purge Messages" button
+
+### View Exchange Bindings
+1. Go to [http://localhost:15672/#/exchanges](http://localhost:15672/#/exchanges)
+2. Click on an exchange
+3. See which queues are bound with which routing keys
+
+### Get a Message (Peek without consuming)
+1. Go to queue details
+2. Scroll to "Get messages"
+3. Set count and click "Get Message(s)"
+
+## Performance Tuning (Optional)
+
+For high-throughput scenarios, consider these RabbitMQ optimizations:
+
+```yaml
+# docker-compose.yml
+services:
+  rabbitmq:
+    environment:
+      # Increase VM memory limit (default 0.4 = 40%)
+      - RABBITMQ_VM_MEMORY_HIGH_WATERMARK=0.6
+      
+      # Enable lazy queues (disk-backed, better for large queues)
+      - RABBITMQ_QUEUE_MASTER_LOCATOR=min-masters
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+```
+
+## Next Steps
+
+Now that our infrastructure is running, we're ready to define our message contracts.
+
+In **Part 3**, we'll:
+- Design event and command interfaces
+- Understand MassTransit message conventions
+- Create the `Contracts` shared library
+- Learn about message correlation
+
+**Key Takeaways**:
+- ✅ Docker Compose orchestrates local infrastructure
+- ✅ RabbitMQ provides exchanges, queues, and routing
+- ✅ OpenTelemetry + Jaeger enable distributed tracing
+- ✅ VS Code compound launch configs streamline debugging
+
+---
+
+**Previous**: [← Part 1 - Introduction](./part-1-introduction-saga-rabbitmq.mdx)  
+**Next**: [Part 3 - Building Message Contracts →](./part-3-message-contracts.mdx)

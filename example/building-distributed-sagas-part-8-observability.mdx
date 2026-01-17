@@ -1,0 +1,648 @@
+---
+title: "Building Distributed Sagas - Part 8: Observability with OpenTelemetry & Jaeger"
+date: "2026-01-17"
+excerpt: "Implement distributed tracing and observability in microservices with OpenTelemetry and Jaeger to visualize message flows and debug complex saga orchestrations."
+tags: ["opentelemetry", "jaeger", "observability", "distributed-tracing", "monitoring", "masstransit"]
+status: "published"
+series: "Building Distributed Sagas with RabbitMQ & MassTransit"
+seriesOrder: 8
+---
+
+# Part 8: Observability with OpenTelemetry & Jaeger
+
+Debugging distributed systems without observability is like navigating in the dark. In this final part, we'll add comprehensive distributed tracing with **OpenTelemetry** and **Jaeger** to visualize how messages flow through our saga orchestration.
+
+## Why Observability Matters
+
+In distributed systems:
+- **Requests span multiple services** - hard to trace manually
+- **Asynchronous processing** - timing is non-deterministic
+- **Failures cascade** - root cause is buried in logs
+- **Performance bottlenecks** - which service is slow?
+
+**Distributed tracing solves this** by tracking requests across service boundaries with correlation IDs.
+
+## What is OpenTelemetry?
+
+**OpenTelemetry (OTEL)** is a CNCF standard for observability:
+
+**Components:**
+1. **Traces**: Request flow across services
+2. **Metrics**: Performance counters (latency, throughput)
+3. **Logs**: Structured event data
+
+**How it works:**
+```
+Service → OTEL SDK → OTLP Exporter → OTEL Collector → Backend (Jaeger/Prometheus)
+```
+
+## Architecture Overview
+
+```
+┌─────────────────┐
+│ OrderService    │ ──┐
+│ (OTEL SDK)      │   │
+└─────────────────┘   │
+                      │ OTLP gRPC
+┌─────────────────┐   │ :4317
+│ InventoryService│ ──┤
+│ (OTEL SDK)      │   ├──→ ┌──────────────────┐
+└─────────────────┘   │    │ OTEL Collector   │
+                      │    └──────────────────┘
+┌─────────────────┐   │              │
+│ PaymentService  │ ──┘              │
+│ (OTEL SDK)      │                  │
+└─────────────────┘                  ▼
+                            ┌─────────────────┐
+                            │ Jaeger Backend  │
+                            │ (UI: :16686)    │
+                            └─────────────────┘
+```
+
+## OpenTelemetry Configuration
+
+### 1. Install Packages
+
+```powershell
+# OrderService
+cd OrderService
+dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
+dotnet add package OpenTelemetry.Instrumentation.AspNetCore
+dotnet add package OpenTelemetry.Extensions.Hosting
+
+# InventoryService & PaymentService
+dotnet add package OpenTelemetry.Exporter.OpenTelemetryProtocol
+dotnet add package OpenTelemetry.Extensions.Hosting
+```
+
+### 2. OrderService Configuration
+
+Update `OrderService/Program.cs`:
+
+```csharp
+using OpenTelemetry.Trace;
+using OpenTelemetry.Resources;
+using MassTransit;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+// ─────────────────────────────────────────────────────────
+// OPENTELEMETRY CONFIGURATION
+// ─────────────────────────────────────────────────────────
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracerProviderBuilder =>
+    {
+        tracerProviderBuilder
+            // Identify this service in traces
+            .SetResourceBuilder(ResourceBuilder.CreateDefault()
+                .AddService("order-service", serviceVersion: "1.0.0"))
+            
+            // Instrument ASP.NET Core (HTTP requests)
+            .AddAspNetCoreInstrumentation(opts =>
+            {
+                opts.RecordException = true;
+                opts.Filter = (httpContext) =>
+                {
+                    // Don't trace health checks or swagger
+                    return !httpContext.Request.Path.StartsWithSegments("/health") &&
+                           !httpContext.Request.Path.StartsWithSegments("/swagger");
+                };
+            })
+            
+            // Instrument MassTransit (message bus)
+            .AddSource(MassTransit.Logging.DiagnosticHeaders.DefaultListenerName)
+            
+            // Export to OTEL Collector
+            .AddOtlpExporter(opts =>
+            {
+                opts.Endpoint = new Uri("http://localhost:4317");
+                opts.Protocol = OpenTelemetry.Exporter.OtlpExportProtocol.Grpc;
+            });
+    });
+
+// EF Core configuration
+builder.Services.AddDbContext<OrderDbContext>(options =>
+{
+    options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection"));
+});
+
+// MassTransit configuration
+builder.Services.AddMassTransit(x =>
+{
+    x.AddSagaStateMachine<OrderStateMachine, OrderState>()
+        .EntityFrameworkRepository(r =>
+        {
+            r.AddDbContext<DbContext, OrderDbContext>((provider, builder) =>
+            {
+                builder.UseSqlite(provider.GetRequiredService<IConfiguration>()
+                    .GetConnectionString("DefaultConnection"));
+            });
+            r.SetOptimisticConcurrency(false);
+            r.LockStatementProvider = new SqliteLockStatementProvider();
+        });
+
+    x.AddConsumer<OrderCompletedConsumer>();
+    x.AddConsumer<OrderFailedConsumer>();
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        var rabbitConfig = builder.Configuration.GetSection("RabbitMQ");
+        cfg.Host(rabbitConfig["Host"] ?? "localhost", "/", h =>
+        {
+            h.Username(rabbitConfig["Username"] ?? "guest");
+            h.Password(rabbitConfig["Password"] ?? "guest");
+        });
+
+        cfg.ConfigureEndpoints(context);
+    });
+});
+
+var app = builder.Build();
+
+// Apply migrations
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<OrderDbContext>();
+    db.Database.Migrate();
+}
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.MapControllers();
+app.Run();
+```
+
+### 3. InventoryService Configuration
+
+Update `InventoryService/Program.cs`:
+
+```csharp
+using OpenTelemetry.Trace;
+using OpenTelemetry.Resources;
+using MassTransit;
+using InventoryService;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+// ─────────────────────────────────────────────────────────
+// OPENTELEMETRY CONFIGURATION
+// ─────────────────────────────────────────────────────────
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracerProviderBuilder =>
+    {
+        tracerProviderBuilder
+            .SetResourceBuilder(ResourceBuilder.CreateDefault()
+                .AddService("inventory-service", serviceVersion: "1.0.0"))
+            .AddSource(MassTransit.Logging.DiagnosticHeaders.DefaultListenerName)
+            .AddOtlpExporter(opts =>
+            {
+                opts.Endpoint = new Uri("http://localhost:4317");
+            });
+    });
+
+// MassTransit configuration
+builder.Services.AddMassTransit(x =>
+{
+    x.AddConsumer<CheckInventoryConsumer>();
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        var rabbitConfig = context.GetRequiredService<IConfiguration>()
+            .GetSection("RabbitMQ");
+        cfg.Host(rabbitConfig["Host"] ?? "localhost", "/", h =>
+        {
+            h.Username(rabbitConfig["Username"] ?? "guest");
+            h.Password(rabbitConfig["Password"] ?? "guest");
+        });
+
+        cfg.ConfigureEndpoints(context);
+    });
+});
+
+var host = builder.Build();
+host.Run();
+```
+
+### 4. PaymentService Configuration
+
+Update `PaymentService/Program.cs`:
+
+```csharp
+using OpenTelemetry.Trace;
+using OpenTelemetry.Resources;
+using MassTransit;
+using PaymentService;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+// ─────────────────────────────────────────────────────────
+// OPENTELEMETRY CONFIGURATION
+// ─────────────────────────────────────────────────────────
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracerProviderBuilder =>
+    {
+        tracerProviderBuilder
+            .SetResourceBuilder(ResourceBuilder.CreateDefault()
+                .AddService("payment-service", serviceVersion: "1.0.0"))
+            .AddSource(MassTransit.Logging.DiagnosticHeaders.DefaultListenerName)
+            .AddOtlpExporter(opts =>
+            {
+                opts.Endpoint = new Uri("http://localhost:4317");
+            });
+    });
+
+// MassTransit configuration
+builder.Services.AddMassTransit(x =>
+{
+    x.AddConsumer<ProcessPaymentConsumer>();
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        var rabbitConfig = context.GetRequiredService<IConfiguration>()
+            .GetSection("RabbitMQ");
+        cfg.Host(rabbitConfig["Host"] ?? "localhost", "/", h =>
+        {
+            h.Username(rabbitConfig["Username"] ?? "guest");
+            h.Password(rabbitConfig["Password"] ?? "guest");
+        });
+
+        cfg.UseMessageRetry(r => r.Interval(3, TimeSpan.FromMilliseconds(500)));
+
+        cfg.ConfigureEndpoints(context);
+    });
+});
+
+var host = builder.Build();
+host.Run();
+```
+
+## OTEL Collector Configuration
+
+Ensure `otel-collector-config.yaml` is configured (already done in Part 2):
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 1024
+
+exporters:
+  # Export to Jaeger
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+  # Log to console for debugging
+  logging:
+    loglevel: debug
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, logging]
+```
+
+## Viewing Traces in Jaeger
+
+### 1. Start Infrastructure & Services
+
+```powershell
+# Start RabbitMQ, Jaeger, OTEL Collector
+docker-compose up -d
+
+# Start services
+dotnet run --project OrderService
+dotnet run --project InventoryService
+dotnet run --project PaymentService
+```
+
+### 2. Submit Test Order
+
+```powershell
+curl -X POST http://localhost:5085/Order `
+  -H "Content-Type: application/json" `
+  -d '{"customerNumber": "TRACE-001", "totalAmount": 99.99}'
+```
+
+### 3. Open Jaeger UI
+
+Navigate to [http://localhost:16686](http://localhost:16686)
+
+**Jaeger UI Walkthrough:**
+
+1. **Service Dropdown**: Select `order-service`
+2. **Operation**: Select `POST /Order`
+3. **Find Traces**: Click "Find Traces"
+4. **Click on a trace**: See the waterfall view
+
+## Understanding the Trace Waterfall
+
+A successful order trace shows:
+
+```
+┌────────────────────────────────────────────────────────────┐
+│ POST /Order (order-service)                    [150ms]    │ ← HTTP Request
+│  ├─ Publish OrderSubmitted                     [2ms]      │ ← Saga start
+│  ├─ Saga: OrderSubmitted → Submitted           [5ms]      │ ← State transition
+│  ├─ Publish CheckInventory                     [1ms]      │ ← Command
+│  │                                                         │
+│  └─→ Consume CheckInventory (inventory-service) [50ms]    │ ← Consumer
+│       └─ Publish StockReserved                 [2ms]      │
+│                                                            │
+│     ├─ Saga: StockReserved → InventoryReserved [3ms]      │
+│     ├─ Publish ProcessPayment                  [1ms]      │
+│     │                                                      │
+│     └─→ Consume ProcessPayment (payment-service) [70ms]   │ ← Consumer
+│          └─ Publish PaymentAccepted            [2ms]      │
+│                                                            │
+│        ├─ Saga: PaymentAccepted → Completed    [3ms]      │
+│        └─ Publish OrderCompleted               [2ms]      │ ← Final event
+└────────────────────────────────────────────────────────────┘
+Total: 150ms
+```
+
+**Key Insights:**
+- See exact timing for each service
+- Identify slow consumers
+- Visualize message flow
+- Detect parallelization opportunities
+
+## Adding Custom Spans
+
+For fine-grained tracing within consumers:
+
+```csharp
+using System.Diagnostics;
+using OpenTelemetry.Trace;
+
+public class CheckInventoryConsumer : IConsumer<CheckInventory>
+{
+    private readonly ILogger<CheckInventoryConsumer> _logger;
+    private static readonly ActivitySource ActivitySource = new("InventoryService");
+
+    public async Task Consume(ConsumeContext<CheckInventory> context)
+    {
+        using var activity = ActivitySource.StartActivity("CheckInventory.Process");
+        activity?.SetTag("order.id", context.Message.OrderId);
+
+        var orderId = context.Message.OrderId;
+        
+        // Custom span for DB lookup
+        using (var dbActivity = ActivitySource.StartActivity("Inventory.DatabaseLookup"))
+        {
+            dbActivity?.SetTag("db.operation", "SELECT");
+            await Task.Delay(500); // Simulate DB query
+        }
+
+        // Business logic
+        if (orderId.EndsWith("0"))
+        {
+            activity?.SetTag("stock.available", false);
+            activity?.AddEvent(new ActivityEvent("StockShortageDetected"));
+            
+            await context.Publish<StockShortage>(new
+            {
+                OrderId = orderId,
+                Reason = "Item out of stock"
+            });
+        }
+        else
+        {
+            activity?.SetTag("stock.available", true);
+            
+            await context.Publish<StockReserved>(new
+            {
+                OrderId = orderId
+            });
+        }
+    }
+}
+```
+
+**Register ActivitySource:**
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracerProviderBuilder =>
+    {
+        tracerProviderBuilder
+            .AddSource("InventoryService") // Custom source
+            .AddSource(MassTransit.Logging.DiagnosticHeaders.DefaultListenerName)
+            // ... other config
+    });
+```
+
+## Trace Correlation
+
+MassTransit automatically propagates trace context:
+
+```csharp
+// OrderService publishes with TraceId
+await context.Publish<CheckInventory>(new { OrderId = "123" });
+// TraceId: abc-def-ghi
+
+// InventoryService receives with same TraceId
+public async Task Consume(ConsumeContext<CheckInventory> context)
+{
+    var traceId = Activity.Current?.TraceId.ToString();
+    // TraceId: abc-def-ghi (same!)
+}
+```
+
+**This links all messages in the same saga to one trace.**
+
+## Custom Metrics (Bonus)
+
+Add performance metrics:
+
+```csharp
+using System.Diagnostics.Metrics;
+
+public class InventoryMetrics
+{
+    private static readonly Meter Meter = new("InventoryService", "1.0.0");
+    
+    public static readonly Counter<long> OrdersProcessed = 
+        Meter.CreateCounter<long>("inventory.orders.processed");
+    
+    public static readonly Histogram<double> ProcessingDuration = 
+        Meter.CreateHistogram<double>("inventory.processing.duration");
+}
+
+// In consumer
+public async Task Consume(ConsumeContext<CheckInventory> context)
+{
+    var sw = Stopwatch.StartNew();
+    
+    // Process...
+    
+    sw.Stop();
+    InventoryMetrics.OrdersProcessed.Add(1);
+    InventoryMetrics.ProcessingDuration.Record(sw.ElapsedMilliseconds);
+}
+```
+
+**Export to Prometheus:**
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(metricsProviderBuilder =>
+    {
+        metricsProviderBuilder
+            .AddMeter("InventoryService")
+            .AddPrometheusExporter();
+    });
+```
+
+## Debugging with Jaeger
+
+### Find Slow Traces
+
+1. Go to Jaeger UI
+2. Set **Min Duration**: 200ms
+3. Find traces slower than 200ms
+4. Identify bottleneck span
+
+### Find Failed Traces
+
+1. Filter by **Tags**: `error=true`
+2. See exception stack traces in span details
+3. Correlate with logs using TraceId
+
+### Compare Traces
+
+1. Select multiple traces (Cmd/Ctrl + Click)
+2. Click "Compare"
+3. See differences in timing
+
+## Production Considerations
+
+### Sampling
+
+Don't trace every request in production (too much data):
+
+```csharp
+builder.Services.AddOpenTelemetry()
+    .WithTracing(tracerProviderBuilder =>
+    {
+        tracerProviderBuilder
+            .SetSampler(new TraceIdRatioBasedSampler(0.1)) // 10% of traces
+            // ... other config
+    });
+```
+
+### Export to APM Tools
+
+Instead of Jaeger, export to production APM:
+
+```csharp
+// Azure Monitor
+.AddAzureMonitorTraceExporter(opts =>
+{
+    opts.ConnectionString = "InstrumentationKey=...";
+})
+
+// Datadog
+.AddDatadogExporter(opts =>
+{
+    opts.AgentUri = new Uri("http://datadog-agent:8126");
+})
+
+// Honeycomb
+.AddOtlpExporter(opts =>
+{
+    opts.Endpoint = new Uri("https://api.honeycomb.io");
+    opts.Headers = $"x-honeycomb-team={apiKey}";
+})
+```
+
+### Sensitive Data
+
+Never log sensitive data in spans:
+
+```csharp
+// ❌ BAD
+activity?.SetTag("credit.card", context.Message.CardNumber);
+
+// ✅ GOOD
+activity?.SetTag("payment.method", "credit_card");
+activity?.SetTag("payment.last4", cardNumber.Substring(cardNumber.Length - 4));
+```
+
+## Observability Checklist
+
+Before production:
+- [ ] OpenTelemetry SDK installed in all services
+- [ ] Traces exported to production backend (not Jaeger)
+- [ ] Sampling configured (10-50% for high traffic)
+- [ ] Custom spans added for critical paths
+- [ ] Sensitive data excluded from traces
+- [ ] Correlation IDs logged in all log statements
+- [ ] Alerts configured for slow traces (p95 > threshold)
+- [ ] Runbooks link to trace queries
+
+## Key Takeaways
+
+✅ **OpenTelemetry provides standardized observability**  
+✅ **Jaeger visualizes distributed traces**  
+✅ **MassTransit automatically propagates trace context**  
+✅ **Custom spans give fine-grained visibility**  
+✅ **Trace waterfall shows bottlenecks**  
+✅ **Sampling reduces production overhead**  
+✅ **Correlation IDs link messages across services**  
+
+## Series Conclusion
+
+Congratulations! You've built a production-grade distributed saga system with:
+
+✅ **Saga orchestration** with MassTransit state machines  
+✅ **Message-driven architecture** with RabbitMQ  
+✅ **Error handling** with retries and DLQs  
+✅ **Compensating transactions** for failures  
+✅ **Comprehensive testing** with TestHarness  
+✅ **Distributed tracing** with OpenTelemetry  
+
+## Next Steps
+
+- **Explore MassTransit Sagas**: [MassTransit Documentation](https://masstransit.io/documentation/configuration/sagas)
+- **OpenTelemetry Deep Dive**: [OpenTelemetry .NET](https://opentelemetry.io/docs/languages/net/)
+- **Production Deployment**: Containerize with Docker, deploy to Kubernetes
+- **Advanced Patterns**: Event sourcing, CQRS, outbox pattern
+
+## Resources
+
+- [GitHub Repository](https://github.com/yourusername/ecommerce-saga-rabbitmq)
+- [MassTransit Documentation](https://masstransit.io/)
+- [OpenTelemetry Specification](https://opentelemetry.io/docs/specs/otel/)
+- [Jaeger Documentation](https://www.jaegertracing.io/docs/)
+- [Saga Pattern - Martin Fowler](https://martinfowler.com/articles/patterns-of-distributed-systems/saga.html)
+
+## Thank You!
+
+Thank you for following this series! Questions or feedback? Reach out on [Twitter/X @yourusername](https://twitter.com/yourusername) or leave a comment below.
+
+**Happy building distributed systems!** 🚀
+
+---
+
+**Previous**: [← Part 7 - Testing Strategies](./part-7-testing-strategies.mdx)  
+**Series Complete**: [← Back to Part 1](./part-1-introduction-saga-rabbitmq.mdx)

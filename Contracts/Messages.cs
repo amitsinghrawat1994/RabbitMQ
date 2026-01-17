@@ -51,6 +51,12 @@ namespace Contracts
         string Reason { get; }
     }
 
+    // Event: Order processing timeout
+    public interface OrderTimeoutExpired
+    {
+        string OrderId { get; }
+    }
+
     // Event: Happy path completion
     public interface OrderCompleted
     {

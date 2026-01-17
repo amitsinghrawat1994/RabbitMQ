@@ -1,0 +1,711 @@
+---
+title: "Building Distributed Sagas - Part 7: Testing with MassTransit TestHarness"
+date: "2026-01-17"
+excerpt: "Master testing distributed sagas and message consumers with MassTransit's in-memory test harness for fast, reliable unit and integration tests."
+tags: ["testing", "masstransit", "unit-testing", "integration-testing", "xunit", "test-harness"]
+status: "published"
+series: "Building Distributed Sagas with RabbitMQ & MassTransit"
+seriesOrder: 7
+---
+
+# Part 7: Testing with MassTransit TestHarness
+
+Testing distributed systems is notoriously challenging. Traditional approaches require spinning up all infrastructure (RabbitMQ, databases) and dealing with timing issues. **MassTransit TestHarness** solves this with a fast, in-memory test bus that makes testing sagas and consumers straightforward and reliable.
+
+## Why TestHarness?
+
+**Traditional Testing Problems:**
+- ❌ Slow (requires real RabbitMQ, DB)
+- ❌ Flaky (timing-dependent)
+- ❌ Complex setup/teardown
+- ❌ Hard to debug failures
+- ❌ Expensive (resource-intensive)
+
+**TestHarness Benefits:**
+- ✅ Fast (in-memory, no infrastructure)
+- ✅ Deterministic (no timing issues)
+- ✅ Simple setup (one line of code)
+- ✅ Easy debugging (full message visibility)
+- ✅ Cheap (runs on build servers)
+
+## Test Project Setup
+
+```powershell
+dotnet new xunit -n ECommerce.Tests
+cd ECommerce.Tests
+
+dotnet add package MassTransit.TestFramework
+dotnet add package Microsoft.Extensions.DependencyInjection
+dotnet add reference ../Contracts/Contracts.csproj
+dotnet add reference ../OrderService/OrderService.csproj
+```
+
+## Basic Consumer Testing
+
+### Testing CheckInventoryConsumer
+
+```csharp
+using Contracts;
+using InventoryService;
+using MassTransit.Testing;
+using Microsoft.Extensions.DependencyInjection;
+using Xunit;
+
+namespace ECommerce.Tests
+{
+    public class InventoryConsumerTests
+    {
+        [Fact]
+        public async Task Should_Publish_StockReserved_When_Stock_Available()
+        {
+            // ─────────────────────────────────────────────────────────
+            // ARRANGE: Setup test harness with consumer
+            // ─────────────────────────────────────────────────────────
+            await using var provider = new ServiceCollection()
+                .AddMassTransitTestHarness(cfg =>
+                {
+                    cfg.AddConsumer<CheckInventoryConsumer>();
+                })
+                .BuildServiceProvider(true);
+
+            var harness = provider.GetRequiredService<ITestHarness>();
+            await harness.Start();
+
+            // ─────────────────────────────────────────────────────────
+            // ACT: Publish CheckInventory command
+            // ─────────────────────────────────────────────────────────
+            await harness.Bus.Publish<CheckInventory>(new
+            {
+                OrderId = "test-happy-path-123" // Does NOT end in '0'
+            });
+
+            // ─────────────────────────────────────────────────────────
+            // ASSERT: Verify StockReserved was published
+            // ─────────────────────────────────────────────────────────
+            Assert.True(await harness.Published.Any<StockReserved>());
+            Assert.False(await harness.Published.Any<StockShortage>());
+            
+            // Verify the consumer consumed the message
+            var consumerHarness = harness.GetConsumerHarness<CheckInventoryConsumer>();
+            Assert.True(await consumerHarness.Consumed.Any<CheckInventory>());
+        }
+
+        [Fact]
+        public async Task Should_Publish_StockShortage_When_OrderId_Ends_In_Zero()
+        {
+            await using var provider = new ServiceCollection()
+                .AddMassTransitTestHarness(cfg =>
+                {
+                    cfg.AddConsumer<CheckInventoryConsumer>();
+                })
+                .BuildServiceProvider(true);
+
+            var harness = provider.GetRequiredService<ITestHarness>();
+            await harness.Start();
+
+            // ─────────────────────────────────────────────────────────
+            // ACT: Use OrderId ending in '0' for stock shortage
+            // ─────────────────────────────────────────────────────────
+            await harness.Bus.Publish<CheckInventory>(new
+            {
+                OrderId = "00000000-0000-0000-0000-000000000000"
+            });
+
+            // ─────────────────────────────────────────────────────────
+            // ASSERT: Verify StockShortage was published
+            // ─────────────────────────────────────────────────────────
+            Assert.True(await harness.Published.Any<StockShortage>());
+            Assert.False(await harness.Published.Any<StockReserved>());
+
+            var publishedMessage = harness.Published.Select<StockShortage>().First();
+            Assert.Equal("00000000-0000-0000-0000-000000000000", 
+                publishedMessage.Context.Message.OrderId);
+        }
+    }
+}
+```
+
+**Key Points:**
+- `AddMassTransitTestHarness`: Creates in-memory bus
+- `harness.Published.Any<T>()`: Check if message type was published
+- `GetConsumerHarness<T>()`: Get consumer-specific test harness
+- No RabbitMQ needed!
+
+## Saga Testing
+
+### Testing OrderStateMachine
+
+```csharp
+using Contracts;
+using MassTransit.Testing;
+using Microsoft.Extensions.DependencyInjection;
+using OrderService.Sagas;
+using Xunit;
+
+namespace ECommerce.Tests
+{
+    public class OrderSagaTests
+    {
+        [Fact]
+        public async Task Should_Complete_Order_On_Happy_Path()
+        {
+            // ─────────────────────────────────────────────────────────
+            // ARRANGE: Setup saga test harness
+            // ─────────────────────────────────────────────────────────
+            await using var provider = new ServiceCollection()
+                .AddMassTransitTestHarness(cfg =>
+                {
+                    cfg.AddSagaStateMachine<OrderStateMachine, OrderState>();
+                })
+                .BuildServiceProvider(true);
+
+            var harness = provider.GetRequiredService<ITestHarness>();
+            await harness.Start();
+
+            var sagaHarness = harness.GetSagaStateMachineHarness<OrderStateMachine, OrderState>();
+            var orderId = Guid.NewGuid().ToString();
+
+            // ─────────────────────────────────────────────────────────
+            // ACT: Simulate happy path message flow
+            // ─────────────────────────────────────────────────────────
+            
+            // 1. Submit order
+            await harness.Bus.Publish<OrderSubmitted>(new
+            {
+                OrderId = orderId,
+                Timestamp = DateTime.UtcNow,
+                CustomerNumber = "TEST-001",
+                TotalAmount = 99.99m
+            });
+
+            // Verify saga created and transitioned to Submitted
+            Assert.True(await sagaHarness.Consumed.Any<OrderSubmitted>());
+            Assert.True(await sagaHarness.Created.Any(x => x.OrderId == orderId));
+            Assert.True(await harness.Published.Any<CheckInventory>());
+
+            // 2. Stock reserved
+            await harness.Bus.Publish<StockReserved>(new
+            {
+                OrderId = orderId
+            });
+
+            Assert.True(await sagaHarness.Consumed.Any<StockReserved>());
+            Assert.True(await harness.Published.Any<ProcessPayment>());
+
+            // 3. Payment accepted
+            await harness.Bus.Publish<PaymentAccepted>(new
+            {
+                OrderId = orderId
+            });
+
+            Assert.True(await sagaHarness.Consumed.Any<PaymentAccepted>());
+            Assert.True(await harness.Published.Any<OrderCompleted>());
+
+            // ─────────────────────────────────────────────────────────
+            // ASSERT: Verify final state
+            // ─────────────────────────────────────────────────────────
+            var completedMsg = harness.Published.Select<OrderCompleted>().First();
+            Assert.Equal(orderId, completedMsg.Context.Message.OrderId);
+        }
+
+        [Fact]
+        public async Task Should_Fail_Order_When_Stock_Shortage()
+        {
+            await using var provider = new ServiceCollection()
+                .AddMassTransitTestHarness(cfg =>
+                {
+                    cfg.AddSagaStateMachine<OrderStateMachine, OrderState>();
+                })
+                .BuildServiceProvider(true);
+
+            var harness = provider.GetRequiredService<ITestHarness>();
+            await harness.Start();
+
+            var sagaHarness = harness.GetSagaStateMachineHarness<OrderStateMachine, OrderState>();
+            var orderId = Guid.NewGuid().ToString();
+
+            // 1. Submit order
+            await harness.Bus.Publish<OrderSubmitted>(new
+            {
+                OrderId = orderId,
+                Timestamp = DateTime.UtcNow,
+                CustomerNumber = "TEST-002",
+                TotalAmount = 50.00m
+            });
+
+            Assert.True(await sagaHarness.Consumed.Any<OrderSubmitted>());
+
+            // 2. Stock shortage
+            await harness.Bus.Publish<StockShortage>(new
+            {
+                OrderId = orderId,
+                Reason = "Out of stock"
+            });
+
+            // ─────────────────────────────────────────────────────────
+            // ASSERT: Verify saga transitioned to Failed
+            // ─────────────────────────────────────────────────────────
+            Assert.True(await sagaHarness.Consumed.Any<StockShortage>());
+            Assert.True(await harness.Published.Any<OrderFailed>());
+            
+            // Should NOT publish ProcessPayment
+            Assert.False(await harness.Published.Any<ProcessPayment>());
+        }
+
+        [Fact]
+        public async Task Should_Fail_Order_When_Payment_Declined()
+        {
+            await using var provider = new ServiceCollection()
+                .AddMassTransitTestHarness(cfg =>
+                {
+                    cfg.AddSagaStateMachine<OrderStateMachine, OrderState>();
+                })
+                .BuildServiceProvider(true);
+
+            var harness = provider.GetRequiredService<ITestHarness>();
+            await harness.Start();
+
+            var sagaHarness = harness.GetSagaStateMachineHarness<OrderStateMachine, OrderState>();
+            var orderId = Guid.NewGuid().ToString();
+
+            // 1. Submit order
+            await harness.Bus.Publish<OrderSubmitted>(new
+            {
+                OrderId = orderId,
+                Timestamp = DateTime.UtcNow,
+                CustomerNumber = "TEST-003",
+                TotalAmount = 200.00m
+            });
+
+            // 2. Stock reserved
+            await harness.Bus.Publish<StockReserved>(new { OrderId = orderId });
+
+            // 3. Payment failed
+            await harness.Bus.Publish<PaymentFailed>(new
+            {
+                OrderId = orderId,
+                Reason = "Card declined"
+            });
+
+            // ─────────────────────────────────────────────────────────
+            // ASSERT: Verify saga transitioned to Failed
+            // ─────────────────────────────────────────────────────────
+            Assert.True(await sagaHarness.Consumed.Any<PaymentFailed>());
+            Assert.True(await harness.Published.Any<OrderFailed>());
+            
+            // Should NOT publish OrderCompleted
+            Assert.False(await harness.Published.Any<OrderCompleted>());
+        }
+    }
+}
+```
+
+## End-to-End Integration Tests
+
+Test the entire system without mocking:
+
+```csharp
+public class OrderWorkflowIntegrationTests
+{
+    [Fact]
+    public async Task Should_Process_Complete_Order_Workflow()
+    {
+        // ─────────────────────────────────────────────────────────
+        // ARRANGE: Setup all components
+        // ─────────────────────────────────────────────────────────
+        await using var provider = new ServiceCollection()
+            .AddMassTransitTestHarness(cfg =>
+            {
+                // Register saga
+                cfg.AddSagaStateMachine<OrderStateMachine, OrderState>();
+                
+                // Register all consumers
+                cfg.AddConsumer<CheckInventoryConsumer>();
+                cfg.AddConsumer<ProcessPaymentConsumer>();
+            })
+            .BuildServiceProvider(true);
+
+        var harness = provider.GetRequiredService<ITestHarness>();
+        await harness.Start();
+
+        // ─────────────────────────────────────────────────────────
+        // ACT: Submit order and let the system process it
+        // ─────────────────────────────────────────────────────────
+        var orderId = "integration-test-456"; // NOT ending in 0, 1, or 2
+
+        await harness.Bus.Publish<OrderSubmitted>(new
+        {
+            OrderId = orderId,
+            Timestamp = DateTime.UtcNow,
+            CustomerNumber = "INT-TEST-001",
+            TotalAmount = 149.99m
+        });
+
+        // ─────────────────────────────────────────────────────────
+        // ASSERT: Verify end-to-end flow
+        // ─────────────────────────────────────────────────────────
+        
+        // Saga consumed OrderSubmitted
+        var sagaHarness = harness.GetSagaStateMachineHarness<OrderStateMachine, OrderState>();
+        Assert.True(await sagaHarness.Consumed.Any<OrderSubmitted>());
+
+        // Inventory consumer consumed CheckInventory
+        var inventoryHarness = harness.GetConsumerHarness<CheckInventoryConsumer>();
+        Assert.True(await inventoryHarness.Consumed.Any<CheckInventory>());
+
+        // Saga consumed StockReserved
+        Assert.True(await sagaHarness.Consumed.Any<StockReserved>());
+
+        // Payment consumer consumed ProcessPayment
+        var paymentHarness = harness.GetConsumerHarness<ProcessPaymentConsumer>();
+        Assert.True(await paymentHarness.Consumed.Any<ProcessPayment>());
+
+        // Saga consumed PaymentAccepted
+        Assert.True(await sagaHarness.Consumed.Any<PaymentAccepted>());
+
+        // Final OrderCompleted was published
+        Assert.True(await harness.Published.Any<OrderCompleted>());
+    }
+}
+```
+
+## Testing Retry Behavior
+
+```csharp
+public class RetryPolicyTests
+{
+    [Fact]
+    public async Task Should_Retry_Consumer_Three_Times()
+    {
+        var attemptCount = 0;
+
+        await using var provider = new ServiceCollection()
+            .AddMassTransitTestHarness(cfg =>
+            {
+                cfg.AddConsumer<FailingConsumer>(c =>
+                {
+                    c.UseMessageRetry(r => r.Immediate(3));
+                });
+            })
+            .BuildServiceProvider(true);
+
+        var harness = provider.GetRequiredService<ITestHarness>();
+        await harness.Start();
+
+        // Publish message
+        await harness.Bus.Publish<ProcessPayment>(new
+        {
+            OrderId = "retry-test-123",
+            Amount = 99.99m,
+            CardNumber = "test"
+        });
+
+        var consumerHarness = harness.GetConsumerHarness<FailingConsumer>();
+        
+        // Verify message was consumed (will fail all retries)
+        Assert.True(await consumerHarness.Consumed.Any<ProcessPayment>());
+        
+        // In real RabbitMQ, message would be in DLQ
+        // With test harness, we just verify consumption happened
+    }
+
+    public class FailingConsumer : IConsumer<ProcessPayment>
+    {
+        private static int _attempts = 0;
+
+        public Task Consume(ConsumeContext<ProcessPayment> context)
+        {
+            _attempts++;
+            throw new Exception($"Attempt {_attempts} failed");
+        }
+    }
+}
+```
+
+## Testing Time-Based Scenarios
+
+For scheduled messages or delays:
+
+```csharp
+[Fact]
+public async Task Should_Process_Scheduled_Message()
+{
+    await using var provider = new ServiceCollection()
+        .AddMassTransitTestHarness(cfg =>
+        {
+            cfg.AddConsumer<ScheduledOrderConsumer>();
+        })
+        .BuildServiceProvider(true);
+
+    var harness = provider.GetRequiredService<ITestHarness>();
+    await harness.Start();
+
+    // Schedule message for future
+    await harness.Bus.SchedulePublish(
+        TimeSpan.FromSeconds(5),
+        new ProcessPayment
+        {
+            OrderId = "scheduled-123",
+            Amount = 50m
+        }
+    );
+
+    // Advance virtual time (test harness feature)
+    await Task.Delay(100); // Small delay to let scheduler process
+
+    // In TestHarness, scheduled messages are processed immediately
+    var consumerHarness = harness.GetConsumerHarness<ScheduledOrderConsumer>();
+    Assert.True(await consumerHarness.Consumed.Any<ProcessPayment>());
+}
+```
+
+## Testing Message Correlation
+
+```csharp
+[Fact]
+public async Task Should_Correlate_Events_By_OrderId()
+{
+    await using var provider = new ServiceCollection()
+        .AddMassTransitTestHarness(cfg =>
+        {
+            cfg.AddSagaStateMachine<OrderStateMachine, OrderState>();
+        })
+        .BuildServiceProvider(true);
+
+    var harness = provider.GetRequiredService<ITestHarness>();
+    await harness.Start();
+
+    var sagaHarness = harness.GetSagaStateMachineHarness<OrderStateMachine, OrderState>();
+
+    var orderId1 = "order-a";
+    var orderId2 = "order-b";
+
+    // Submit two orders
+    await harness.Bus.Publish<OrderSubmitted>(new
+    {
+        OrderId = orderId1,
+        Timestamp = DateTime.UtcNow,
+        CustomerNumber = "CUST-001",
+        TotalAmount = 100m
+    });
+
+    await harness.Bus.Publish<OrderSubmitted>(new
+    {
+        OrderId = orderId2,
+        Timestamp = DateTime.UtcNow,
+        CustomerNumber = "CUST-002",
+        TotalAmount = 200m
+    });
+
+    // Verify two saga instances created
+    Assert.True(await sagaHarness.Created.Any(x => x.OrderId == orderId1));
+    Assert.True(await sagaHarness.Created.Any(x => x.OrderId == orderId2));
+
+    // Send StockReserved for order-a only
+    await harness.Bus.Publish<StockReserved>(new { OrderId = orderId1 });
+
+    // Verify only order-a received StockReserved
+    var publishedMessages = harness.Published.Select<ProcessPayment>().ToList();
+    Assert.Single(publishedMessages);
+    Assert.Equal(orderId1, publishedMessages.First().Context.Message.OrderId);
+}
+```
+
+## Verifying Message Content
+
+```csharp
+[Fact]
+public async Task Should_Publish_Correct_Payment_Amount()
+{
+    await using var provider = new ServiceCollection()
+        .AddMassTransitTestHarness(cfg =>
+        {
+            cfg.AddSagaStateMachine<OrderStateMachine, OrderState>();
+        })
+        .BuildServiceProvider(true);
+
+    var harness = provider.GetRequiredService<ITestHarness>();
+    await harness.Start();
+
+    var expectedAmount = 249.99m;
+
+    await harness.Bus.Publish<OrderSubmitted>(new
+    {
+        OrderId = "amount-test",
+        Timestamp = DateTime.UtcNow,
+        CustomerNumber = "CUST-003",
+        TotalAmount = expectedAmount
+    });
+
+    await harness.Bus.Publish<StockReserved>(new { OrderId = "amount-test" });
+
+    // Verify ProcessPayment has correct amount
+    var publishedMessage = harness.Published.Select<ProcessPayment>().First();
+    Assert.Equal(expectedAmount, publishedMessage.Context.Message.Amount);
+}
+```
+
+## Test Organization Best Practices
+
+### Arrange-Act-Assert Pattern
+
+```csharp
+[Fact]
+public async Task Should_Follow_AAA_Pattern()
+{
+    // ───────── ARRANGE ─────────
+    await using var provider = CreateTestProvider();
+    var harness = provider.GetRequiredService<ITestHarness>();
+    await harness.Start();
+
+    // ───────── ACT ─────────
+    await harness.Bus.Publish<OrderSubmitted>(CreateTestOrder());
+
+    // ───────── ASSERT ─────────
+    Assert.True(await harness.Published.Any<CheckInventory>());
+}
+```
+
+### Test Fixtures for Reusability
+
+```csharp
+public class SagaTestFixture : IAsyncLifetime
+{
+    private ServiceProvider? _provider;
+    public ITestHarness Harness { get; private set; } = null!;
+
+    public async Task InitializeAsync()
+    {
+        _provider = new ServiceCollection()
+            .AddMassTransitTestHarness(cfg =>
+            {
+                cfg.AddSagaStateMachine<OrderStateMachine, OrderState>();
+            })
+            .BuildServiceProvider(true);
+
+        Harness = _provider.GetRequiredService<ITestHarness>();
+        await Harness.Start();
+    }
+
+    public async Task DisposeAsync()
+    {
+        if (_provider != null)
+            await _provider.DisposeAsync();
+    }
+}
+
+public class OrderSagaTests : IClassFixture<SagaTestFixture>
+{
+    private readonly SagaTestFixture _fixture;
+
+    public OrderSagaTests(SagaTestFixture fixture)
+    {
+        _fixture = fixture;
+    }
+
+    [Fact]
+    public async Task Test1()
+    {
+        await _fixture.Harness.Bus.Publish<OrderSubmitted>(/*...*/);
+        // ...
+    }
+
+    [Fact]
+    public async Task Test2()
+    {
+        // Reuse fixture
+    }
+}
+```
+
+## Debugging Failed Tests
+
+### View Published Messages
+
+```csharp
+// After test runs
+var publishedMessages = harness.Published.Select<OrderCompleted>().ToList();
+foreach (var msg in publishedMessages)
+{
+    Console.WriteLine($"OrderId: {msg.Context.Message.OrderId}");
+    Console.WriteLine($"Timestamp: {msg.Context.SentTime}");
+}
+```
+
+### Check Consumed Messages
+
+```csharp
+var consumerHarness = harness.GetConsumerHarness<CheckInventoryConsumer>();
+var consumedMessages = consumerHarness.Consumed.Select<CheckInventory>().ToList();
+
+Console.WriteLine($"Consumed {consumedMessages.Count} messages");
+```
+
+### Enable Test Logging
+
+```csharp
+await using var provider = new ServiceCollection()
+    .AddLogging(cfg => cfg.AddConsole().SetMinimumLevel(LogLevel.Debug))
+    .AddMassTransitTestHarness(cfg =>
+    {
+        cfg.AddConsumer<CheckInventoryConsumer>();
+    })
+    .BuildServiceProvider(true);
+```
+
+## Testing Performance
+
+```csharp
+[Fact]
+public async Task Should_Process_100_Orders_In_Under_1_Second()
+{
+    await using var provider = new ServiceCollection()
+        .AddMassTransitTestHarness(cfg =>
+        {
+            cfg.AddSagaStateMachine<OrderStateMachine, OrderState>();
+        })
+        .BuildServiceProvider(true);
+
+    var harness = provider.GetRequiredService<ITestHarness>();
+    await harness.Start();
+
+    var stopwatch = Stopwatch.StartNew();
+
+    // Publish 100 orders
+    var tasks = Enumerable.Range(0, 100).Select(i =>
+        harness.Bus.Publish<OrderSubmitted>(new
+        {
+            OrderId = $"perf-test-{i}",
+            Timestamp = DateTime.UtcNow,
+            CustomerNumber = "PERF-TEST",
+            TotalAmount = 99.99m
+        })
+    );
+
+    await Task.WhenAll(tasks);
+
+    stopwatch.Stop();
+
+    Assert.True(stopwatch.ElapsedMilliseconds < 1000, 
+        $"Took {stopwatch.ElapsedMilliseconds}ms");
+}
+```
+
+## Key Takeaways
+
+✅ **TestHarness is fast** - no infrastructure needed  
+✅ **Deterministic tests** - no timing issues  
+✅ **Test sagas and consumers** in isolation or together  
+✅ **Verify published messages** with `.Published.Any<T>()`  
+✅ **Check consumption** with consumer harness  
+✅ **Use AAA pattern** for clarity  
+✅ **Test fixtures** reduce boilerplate  
+
+## Next Steps
+
+In **Part 8**, we'll add comprehensive observability with OpenTelemetry and Jaeger for distributed tracing across our microservices.
+
+---
+
+**Previous**: [← Part 6 - Error Handling & Retries](./part-6-error-handling-retries.mdx)  
+**Next**: [Part 8 - Observability with OpenTelemetry & Jaeger →](./part-8-observability.mdx)

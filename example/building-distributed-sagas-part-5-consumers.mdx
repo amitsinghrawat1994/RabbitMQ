@@ -1,0 +1,669 @@
+---
+title: "Building Distributed Sagas - Part 5: Building Microservices Consumers"
+date: "2026-01-17"
+excerpt: "Implement InventoryService and PaymentService as background workers that consume commands, execute business logic, and publish events in a saga-orchestrated system."
+tags: ["masstransit", "consumers", "microservices", "dotnet", "worker-service", "messaging"]
+status: "published"
+series: "Building Distributed Sagas with RabbitMQ & MassTransit"
+seriesOrder: 5
+---
+
+# Part 5: Building Microservices Consumers
+
+Now that our saga orchestrator is in place, we need the worker services that perform the actual business operations. In this part, we'll build **InventoryService** and **PaymentService** as .NET background workers that consume commands and publish events.
+
+## Worker Service Pattern
+
+Worker services are long-running background processes perfect for message consumers:
+
+**Characteristics:**
+- No HTTP endpoints (pure message consumers)
+- Hosted as Windows Services or Linux daemons
+- Lightweight and focused on a single domain
+- Independently scalable
+
+```csharp
+// Traditional ASP.NET Core API
+var builder = WebApplication.CreateBuilder(args);
+var app = builder.Build();
+app.MapControllers();
+app.Run();
+
+// Worker Service (Message Consumer)
+var builder = Host.CreateApplicationBuilder(args);
+builder.Services.AddMassTransit(/*...*/);
+var host = builder.Build();
+host.Run();
+```
+
+## Project Setup
+
+### Create InventoryService
+
+```powershell
+dotnet new worker -n InventoryService
+cd InventoryService
+dotnet add package MassTransit.RabbitMQ
+dotnet add reference ../Contracts/Contracts.csproj
+```
+
+### Create PaymentService
+
+```powershell
+dotnet new worker -n PaymentService
+cd PaymentService
+dotnet add package MassTransit.RabbitMQ
+dotnet add reference ../Contracts/Contracts.csproj
+```
+
+## InventoryService Implementation
+
+### CheckInventoryConsumer.cs
+
+This consumer checks stock availability and publishes the result.
+
+```csharp
+using System;
+using System.Threading.Tasks;
+using Contracts;
+using MassTransit;
+using Microsoft.Extensions.Logging;
+
+namespace InventoryService
+{
+    /// <summary>
+    /// Consumes CheckInventory commands from the saga.
+    /// Simulates stock checking and publishes StockReserved or StockShortage.
+    /// </summary>
+    public class CheckInventoryConsumer : IConsumer<CheckInventory>
+    {
+        private readonly ILogger<CheckInventoryConsumer> _logger;
+
+        public CheckInventoryConsumer(ILogger<CheckInventoryConsumer> logger)
+        {
+            _logger = logger;
+        }
+
+        public async Task Consume(ConsumeContext<CheckInventory> context)
+        {
+            var orderId = context.Message.OrderId;
+            
+            _logger.LogInformation(
+                "🔍 Checking inventory for Order: {OrderId} (MessageId: {MessageId})",
+                orderId,
+                context.MessageId
+            );
+
+            // Simulate database lookup
+            await Task.Delay(500);
+
+            // ─────────────────────────────────────────────────────────
+            // DETERMINISTIC TESTING LOGIC
+            // ─────────────────────────────────────────────────────────
+            // If OrderId ends in '0' → StockShortage
+            // Otherwise → StockReserved
+            
+            if (orderId.EndsWith("0"))
+            {
+                _logger.LogWarning("❌ Stock shortage for Order: {OrderId}", orderId);
+                
+                await context.Publish<StockShortage>(new
+                {
+                    OrderId = orderId,
+                    Reason = "Item out of stock (simulated)"
+                });
+            }
+            else
+            {
+                _logger.LogInformation("✅ Stock reserved for Order: {OrderId}", orderId);
+                
+                await context.Publish<StockReserved>(new
+                {
+                    OrderId = orderId
+                });
+            }
+        }
+    }
+}
+```
+
+**Key Points:**
+- Implements `IConsumer<CheckInventory>`
+- Uses `context.Publish<T>` to broadcast events (not `context.Send`)
+- Deterministic logic for testing (OrderId suffix)
+
+### Program.cs (InventoryService)
+
+```csharp
+using MassTransit;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using InventoryService;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+// MassTransit Configuration
+builder.Services.AddMassTransit(x =>
+{
+    // Register the CheckInventory consumer
+    x.AddConsumer<CheckInventoryConsumer>();
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        var rabbitConfig = context.GetRequiredService<IConfiguration>()
+            .GetSection("RabbitMQ");
+        
+        cfg.Host(rabbitConfig["Host"] ?? "localhost", "/", h =>
+        {
+            h.Username(rabbitConfig["Username"] ?? "guest");
+            h.Password(rabbitConfig["Password"] ?? "guest");
+        });
+
+        // Auto-configure endpoint for CheckInventoryConsumer
+        // Creates queue: "inventory-service"
+        cfg.ConfigureEndpoints(context);
+    });
+});
+
+var host = builder.Build();
+host.Run();
+```
+
+### appsettings.json (InventoryService)
+
+```json
+{
+  "RabbitMQ": {
+    "Host": "localhost",
+    "Username": "guest",
+    "Password": "guest"
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "MassTransit": "Information",
+      "InventoryService": "Debug"
+    }
+  }
+}
+```
+
+## PaymentService Implementation
+
+### ProcessPaymentConsumer.cs
+
+This consumer processes payments with three scenarios: success, hard failure, and transient failure (for retry testing).
+
+```csharp
+using System;
+using System.Threading.Tasks;
+using Contracts;
+using MassTransit;
+using Microsoft.Extensions.Logging;
+
+namespace PaymentService
+{
+    /// <summary>
+    /// Consumes ProcessPayment commands from the saga.
+    /// Simulates payment processing with multiple failure scenarios.
+    /// </summary>
+    public class ProcessPaymentConsumer : IConsumer<ProcessPayment>
+    {
+        private readonly ILogger<ProcessPaymentConsumer> _logger;
+
+        public ProcessPaymentConsumer(ILogger<ProcessPaymentConsumer> logger)
+        {
+            _logger = logger;
+        }
+
+        public async Task Consume(ConsumeContext<ProcessPayment> context)
+        {
+            var orderId = context.Message.OrderId;
+            var amount = context.Message.Amount;
+            var cardNumber = context.Message.CardNumber;
+
+            _logger.LogInformation(
+                "💳 Processing payment for Order: {OrderId}, Amount: ${Amount:F2} (MessageId: {MessageId})",
+                orderId,
+                amount,
+                context.MessageId
+            );
+
+            // Simulate payment gateway latency
+            await Task.Delay(300);
+
+            // ─────────────────────────────────────────────────────────
+            // DETERMINISTIC TESTING LOGIC
+            // ─────────────────────────────────────────────────────────
+            
+            // 1. Hard Failure (ending in '1')
+            if (orderId.EndsWith("1"))
+            {
+                _logger.LogWarning("❌ Payment declined for Order: {OrderId}", orderId);
+                
+                await context.Publish<PaymentFailed>(new
+                {
+                    OrderId = orderId,
+                    Reason = "Credit card limit exceeded (simulated)"
+                });
+                return;
+            }
+
+            // 2. Transient Failure (ending in '2') - triggers retry policy
+            if (orderId.EndsWith("2"))
+            {
+                _logger.LogError(
+                    "⚠️ Payment gateway unavailable for Order: {OrderId} (will retry)",
+                    orderId
+                );
+                
+                throw new InvalidOperationException(
+                    "Payment gateway temporarily unavailable (simulated)"
+                );
+            }
+
+            // 3. Success (all other OrderIds)
+            _logger.LogInformation("✅ Payment accepted for Order: {OrderId}", orderId);
+            
+            await context.Publish<PaymentAccepted>(new
+            {
+                OrderId = orderId
+            });
+        }
+    }
+}
+```
+
+**Key Scenarios:**
+1. **OrderId ends in '1'**: Hard failure → Publish `PaymentFailed`
+2. **OrderId ends in '2'**: Transient failure → Throw exception → Retry
+3. **All others**: Success → Publish `PaymentAccepted`
+
+### Program.cs (PaymentService)
+
+```csharp
+using MassTransit;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.DependencyInjection;
+using PaymentService;
+
+var builder = Host.CreateApplicationBuilder(args);
+
+// MassTransit Configuration
+builder.Services.AddMassTransit(x =>
+{
+    // Register the ProcessPayment consumer
+    x.AddConsumer<ProcessPaymentConsumer>();
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        var rabbitConfig = context.GetRequiredService<IConfiguration>()
+            .GetSection("RabbitMQ");
+        
+        cfg.Host(rabbitConfig["Host"] ?? "localhost", "/", h =>
+        {
+            h.Username(rabbitConfig["Username"] ?? "guest");
+            h.Password(rabbitConfig["Password"] ?? "guest");
+        });
+
+        // ─────────────────────────────────────────────────────────
+        // RETRY POLICY
+        // ─────────────────────────────────────────────────────────
+        // Retry 3 times with 500ms interval
+        // After 3 retries, message moves to payment-service_error queue
+        cfg.UseMessageRetry(r => r.Interval(3, TimeSpan.FromMilliseconds(500)));
+
+        // Auto-configure endpoint for ProcessPaymentConsumer
+        // Creates queue: "payment-service"
+        cfg.ConfigureEndpoints(context);
+    });
+});
+
+var host = builder.Build();
+host.Run();
+```
+
+**Retry Policy:**
+- Attempts: 3 retries (4 total attempts: 1 original + 3 retries)
+- Interval: 500ms between attempts
+- Failure: After all retries exhausted → Message to DLQ (`payment-service_error`)
+
+### appsettings.json (PaymentService)
+
+```json
+{
+  "RabbitMQ": {
+    "Host": "localhost",
+    "Username": "guest",
+    "Password": "guest"
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "MassTransit": "Information",
+      "PaymentService": "Debug"
+    }
+  }
+}
+```
+
+## Testing the Complete Flow
+
+### 1. Start Infrastructure
+
+```powershell
+docker-compose up -d
+```
+
+### 2. Start All Services
+
+**Terminal 1 (OrderService):**
+```powershell
+cd OrderService
+dotnet run
+```
+
+**Terminal 2 (InventoryService):**
+```powershell
+cd InventoryService
+dotnet run
+```
+
+**Terminal 3 (PaymentService):**
+```powershell
+cd PaymentService
+dotnet run
+```
+
+### 3. Submit Test Orders
+
+**Happy Path (Success):**
+```powershell
+curl -X POST http://localhost:5085/Order `
+  -H "Content-Type: application/json" `
+  -d '{"customerNumber": "CUST-001", "totalAmount": 99.99}'
+```
+
+**Expected Flow:**
+```
+OrderService:   OrderSubmitted
+               ↓
+InventoryService: CheckInventory → StockReserved ✅
+               ↓
+PaymentService:  ProcessPayment → PaymentAccepted ✅
+               ↓
+OrderService:   OrderCompleted ✅
+```
+
+**Stock Shortage (OrderId ending in '0'):**
+```powershell
+curl -X POST http://localhost:5085/Order `
+  -H "Content-Type: application/json" `
+  -d '{"orderId": "00000000-0000-0000-0000-000000000000", "customerNumber": "CUST-002", "totalAmount": 50.00}'
+```
+
+**Expected Flow:**
+```
+OrderService:   OrderSubmitted
+               ↓
+InventoryService: CheckInventory → StockShortage ❌
+               ↓
+OrderService:   OrderFailed ❌
+```
+
+**Payment Declined (OrderId ending in '1'):**
+```powershell
+curl -X POST http://localhost:5085/Order `
+  -H "Content-Type: application/json" `
+  -d '{"orderId": "00000000-0000-0000-0000-000000000001", "customerNumber": "CUST-003", "totalAmount": 200.00}'
+```
+
+**Expected Flow:**
+```
+OrderService:   OrderSubmitted
+               ↓
+InventoryService: CheckInventory → StockReserved ✅
+               ↓
+PaymentService:  ProcessPayment → PaymentFailed ❌
+               ↓
+OrderService:   OrderFailed ❌
+```
+
+**Transient Failure (OrderId ending in '2'):**
+```powershell
+curl -X POST http://localhost:5085/Order `
+  -H "Content-Type: application/json" `
+  -d '{"orderId": "00000000-0000-0000-0000-000000000002", "customerNumber": "CUST-004", "totalAmount": 150.00}'
+```
+
+**Expected Flow:**
+```
+OrderService:   OrderSubmitted
+               ↓
+InventoryService: CheckInventory → StockReserved ✅
+               ↓
+PaymentService:  ProcessPayment → Exception ⚠️
+               Retry 1 (500ms) → Exception ⚠️
+               Retry 2 (500ms) → Exception ⚠️
+               Retry 3 (500ms) → Exception ⚠️
+               → Dead Letter Queue (payment-service_error)
+```
+
+### 4. Verify RabbitMQ
+
+Go to [http://localhost:15672/#/queues](http://localhost:15672/#/queues):
+
+**Queues Created:**
+- `orders-saga` (saga instances)
+- `inventory-service` (CheckInventory commands)
+- `payment-service` (ProcessPayment commands)
+- `payment-service_error` (DLQ for failed payments)
+
+**Check DLQ for Transient Failures:**
+1. Click on `payment-service_error`
+2. Scroll to "Get messages"
+3. Click "Get Message(s)"
+4. See the failed message with exception details
+
+## Consumer Best Practices
+
+### 1. Idempotency
+
+Ensure consumers can safely handle duplicate messages:
+
+```csharp
+public async Task Consume(ConsumeContext<ProcessPayment> context)
+{
+    var orderId = context.Message.OrderId;
+    
+    // Check if already processed
+    if (await _repository.PaymentExistsAsync(orderId))
+    {
+        _logger.LogWarning("Payment already processed for Order: {OrderId}", orderId);
+        return; // Skip duplicate
+    }
+    
+    // Process payment...
+}
+```
+
+### 2. Logging with Correlation IDs
+
+Always log correlation IDs for tracing:
+
+```csharp
+_logger.LogInformation(
+    "Processing {MessageType} for Order {OrderId} (MessageId: {MessageId}, ConversationId: {ConversationId})",
+    nameof(CheckInventory),
+    orderId,
+    context.MessageId,
+    context.ConversationId
+);
+```
+
+### 3. Graceful Error Handling
+
+Differentiate between transient and permanent errors:
+
+```csharp
+public async Task Consume(ConsumeContext<ProcessPayment> context)
+{
+    try
+    {
+        await _paymentGateway.ChargeAsync(context.Message);
+    }
+    catch (PaymentDeclinedException ex)
+    {
+        // Permanent failure - publish PaymentFailed
+        await context.Publish<PaymentFailed>(new { Reason = ex.Message });
+    }
+    catch (HttpRequestException ex)
+    {
+        // Transient failure - throw to trigger retry
+        _logger.LogError(ex, "Gateway unavailable, will retry");
+        throw;
+    }
+}
+```
+
+### 4. Unit Testing Consumers
+
+```csharp
+[Fact]
+public async Task Should_Publish_StockReserved_When_Stock_Available()
+{
+    await using var provider = new ServiceCollection()
+        .AddMassTransitTestHarness(cfg =>
+        {
+            cfg.AddConsumer<CheckInventoryConsumer>();
+        })
+        .BuildServiceProvider(true);
+
+    var harness = provider.GetRequiredService<ITestHarness>();
+    await harness.Start();
+
+    await harness.Bus.Publish<CheckInventory>(new
+    {
+        OrderId = "test-123" // Does NOT end in '0'
+    });
+
+    // Verify StockReserved was published
+    Assert.True(await harness.Published.Any<StockReserved>());
+    
+    // Verify StockShortage was NOT published
+    Assert.False(await harness.Published.Any<StockShortage>());
+}
+```
+
+## Scalability Considerations
+
+### Horizontal Scaling
+
+Run multiple instances of the same consumer:
+
+```powershell
+# Terminal 1
+dotnet run --project PaymentService
+
+# Terminal 2 (same service, different process)
+dotnet run --project PaymentService
+```
+
+**RabbitMQ automatically load-balances** messages across consumers.
+
+### Prefetch Count
+
+Control how many messages a consumer fetches at once:
+
+```csharp
+cfg.ReceiveEndpoint("payment-service", e =>
+{
+    e.PrefetchCount = 10; // Fetch 10 messages at a time
+    e.ConfigureConsumer<ProcessPaymentConsumer>(context);
+});
+```
+
+**Guidelines:**
+- Low latency, high CPU: `PrefetchCount = 1-5`
+- High throughput, I/O bound: `PrefetchCount = 10-50`
+
+### Concurrency
+
+Limit concurrent message processing:
+
+```csharp
+cfg.ReceiveEndpoint("payment-service", e =>
+{
+    e.ConcurrentMessageLimit = 5; // Process max 5 messages concurrently
+    e.ConfigureConsumer<ProcessPaymentConsumer>(context);
+});
+```
+
+## Monitoring Consumer Health
+
+### Custom Health Checks
+
+```csharp
+// PaymentService/Program.cs
+builder.Services.AddHealthChecks()
+    .AddRabbitMQ(rabbitConnectionString: "amqp://guest:guest@localhost:5672");
+
+// Add health check endpoint
+app.MapHealthChecks("/health");
+```
+
+### Log Structured Data
+
+```csharp
+_logger.LogInformation(
+    "Payment processed: {OrderId}, {Amount}, {Duration}ms",
+    orderId,
+    amount,
+    stopwatch.ElapsedMilliseconds
+);
+```
+
+## Common Issues
+
+### Issue 1: Consumer Not Receiving Messages
+
+**Symptom**: Messages stay in queue but aren't consumed
+
+**Solution**: Verify queue binding in RabbitMQ Management UI:
+1. Go to Queues → `payment-service`
+2. Check "Bindings" section
+3. Should see binding to `Contracts:ProcessPayment` exchange
+
+### Issue 2: Duplicate Message Processing
+
+**Symptom**: Same order processed multiple times
+
+**Solution**: Implement idempotency checks (see best practices above)
+
+### Issue 3: Messages Going to DLQ Immediately
+
+**Symptom**: No retries, straight to `_error` queue
+
+**Solution**: Verify retry policy is configured BEFORE `ConfigureEndpoints`:
+```csharp
+cfg.UseMessageRetry(r => r.Interval(3, TimeSpan.FromMilliseconds(500)));
+cfg.ConfigureEndpoints(context); // Must be after retry config
+```
+
+## Key Takeaways
+
+✅ **Worker services** are perfect for message consumers  
+✅ **Deterministic testing** with OrderId suffixes  
+✅ **Retry policies** handle transient failures  
+✅ **Publish events**, don't send commands (from consumers)  
+✅ **Idempotency** prevents duplicate processing  
+✅ **Horizontal scaling** via multiple instances  
+
+## Next Steps
+
+In **Part 6**, we'll deep-dive into error handling strategies, retry policies, dead letter queues, and compensating transactions.
+
+---
+
+**Previous**: [← Part 4 - Order State Machine](./part-4-order-state-machine.mdx)  
+**Next**: [Part 6 - Error Handling & Retries →](./part-6-error-handling-retries.mdx)

@@ -11,7 +11,6 @@ namespace OrderService.Sagas
             entity.Property(x => x.CurrentState).HasMaxLength(64);
             entity.Property(x => x.CustomerNumber).HasMaxLength(256);
             entity.Property(x => x.OrderId).HasMaxLength(64);
-
         }
     }
 }

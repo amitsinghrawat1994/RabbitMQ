@@ -1,0 +1,200 @@
+---
+title: "Azure Service Bus Tutorial Part 1: Introduction to Message-Driven Architecture"
+date: "2025-11-26"
+excerpt: "Learn the fundamentals of Azure Service Bus and how to implement message-driven architecture in .NET applications with a real-world order processing example."
+tags: ["azure", "service-bus", "dotnet", "microservices", "messaging"]
+status: "published"
+series: "Azure Service Bus Tutorial"
+seriesOrder: 1
+---
+
+# Azure Service Bus Tutorial Part 1: Introduction to Message-Driven Architecture
+
+In modern distributed systems, reliable communication between services is crucial. Azure Service Bus provides a robust messaging infrastructure that enables decoupled, asynchronous communication. This tutorial series will guide you through building a complete order processing system using Azure Service Bus with .NET 9.
+
+## What is Azure Service Bus?
+
+Azure Service Bus is a fully managed enterprise message broker that enables reliable communication between applications and services. It supports two primary messaging patterns:
+
+- **Queues**: Point-to-point communication where messages are sent to a queue and consumed by a single receiver
+- **Topics and Subscriptions**: Publish-subscribe pattern where messages are sent to a topic and can be consumed by multiple subscribers
+
+## Why Use Message-Driven Architecture?
+
+Message-driven architecture offers several benefits:
+
+- **Decoupling**: Services don't need to know about each other directly
+- **Scalability**: Components can scale independently
+- **Reliability**: Messages persist until processed
+- **Asynchronous Processing**: Non-blocking operations improve performance
+- **Resilience**: Built-in retry mechanisms and dead-letter queues
+
+## Azure Service Bus vs Alternatives
+
+Choosing the right messaging platform is crucial for your architecture. Here's how Azure Service Bus compares to popular alternatives:
+
+| Feature | Azure Service Bus | RabbitMQ | Apache Kafka |
+|---------|------------------|----------|---------------|
+| **Managed Service** | Yes (Fully managed) | No (Self-hosted) | Partial (MSK/Confluent) |
+| **FIFO Guarantee** | Yes (Sessions) | Yes | Yes (Partitions) |
+| **Dead Letter Queue** | Yes (Built-in) | Yes | No (Manual) |
+| **Message TTL** | Yes | Yes | Yes |
+| **Transaction Support** | Yes | Yes | Yes |
+| **Cloud Native** | Yes (Azure-first) | Partial (Self-host) | Partial (Self-host) |
+| **Pricing Model** | Pay-per-use | Infrastructure costs | Infrastructure costs |
+| **Max Message Size** | 256 KB (1 MB Premium) | Configurable | 1 MB default |
+| **Duplicate Detection** | Yes (Built-in) | No (Manual) | No (Manual) |
+| **Geo-Disaster Recovery** | Yes (Built-in) | No (Manual) | Complex setup |
+
+**Choose Azure Service Bus if:**
+- You're already on Azure
+- Want fully managed service with zero infrastructure
+- Need enterprise features like duplicate detection
+- Require built-in disaster recovery
+
+**Choose RabbitMQ if:**
+- Need on-premises deployment
+- Require complex routing patterns
+- Have existing RabbitMQ expertise
+
+**Choose Apache Kafka if:**
+- Need extremely high throughput (millions of messages/sec)
+- Building event sourcing or log streaming systems
+- Require long-term message retention
+
+## Real-World Order Processing Example
+
+We'll build an order processing system that demonstrates:
+
+- Order creation via REST API
+- Asynchronous inventory management
+- Event-driven architecture
+- Error handling and idempotency
+- Observability with OpenTelemetry
+
+## Project Structure Overview
+
+```
+OrderSystem/
+├── src/
+│   ├── OrderSystem.Shared/          # Shared contracts and models
+│   ├── OrderSystem.Api/             # REST API for order management
+│   └── OrderSystem.Worker/          # Background processor for inventory
+└── infra/                           # Azure CLI/Bicep/Terraform scripts for dev namespace
+```
+
+## What You'll Learn
+
+This 7-part (and growing) tutorial covers:
+
+1. **Introduction** (this post)
+2. **Setting up Azure Service Bus Development Namespace (no emulator)**
+3. **Building Shared Contracts**
+4. **Implementing the Order API with Outbox Pattern**
+5. **Creating the Inventory Worker**
+6. **Adding Observability**
+7. **Testing and Production Deployment**
+
+## Prerequisites
+
+### Required Software
+- **.NET 9 SDK** - [Download here](https://dotnet.microsoft.com/download/dotnet/9.0)
+- **Docker Desktop** - [Download here](https://www.docker.com/products/docker-desktop)
+- **Visual Studio 2022** or **VS Code** with C# extension
+- **Git** for version control
+
+### Knowledge Prerequisites
+- Basic understanding of C# and ASP.NET Core
+- Familiarity with REST APIs
+- Basic Docker concepts (containers, images, docker-compose)
+- Understanding of async/await in C#
+
+### Optional (for production deployment)
+- Azure subscription - [Get free trial](https://azure.microsoft.com/free/)
+- Azure CLI installed
+
+### Verify Your Setup
+
+Run these commands to verify your environment:
+
+```powershell
+# Check .NET version (should be 9.0 or higher)
+dotnet --version
+
+# Check Docker is running
+docker --version
+docker ps
+
+# Check Docker Compose (newer syntax is `docker compose`)
+docker compose version
+```
+
+## Complete Source Code
+
+The complete working code for this tutorial series is available on GitHub:
+
+📦 **Repository**: [Azure Service Bus Tutorial - OrderSystem](https://github.com/amitsinghrawat1994/OrderSystem)
+
+### Repository Structure
+
+Each part of the tutorial corresponds to a branch in the repository:
+
+- `main` - Complete working solution
+- `part-1-introduction` - Basic project setup
+- `part-2-infrastructure` - Docker Compose setup
+- `part-3-contracts` - Shared contracts library
+- `part-4-api-outbox` - Order API with outbox pattern
+- `part-5-worker` - Inventory worker service
+- `part-6-observability` - OpenTelemetry integration
+- `part-7-production` - Testing and deployment
+
+### How to Use the Repository
+
+```bash
+# Clone the repository
+git clone https://github.com/amitsinghrawat1994/OrderSystem.git
+cd OrderSystem
+
+# Follow along with a specific part
+git checkout part-2-infrastructure
+
+# Or use the complete solution
+git checkout main
+```
+
+⭐ **Star the repo** if you find it helpful! Issues and PRs are welcome.
+
+## Getting Started
+
+You can follow along by cloning the repository:
+
+```bash
+git clone https://github.com/amitsinghrawat1994/OrderSystem.git
+cd OrderSystem
+```
+
+Or build the system from scratch following each tutorial part.
+
+## Important Note: No Official Local Emulator
+
+Azure Service Bus does not provide an official local emulator. For development, provision a low-cost Standard namespace in Azure and point your apps to it. The OrderSystem repository also includes an optional experimental emulator (not fully feature-complete) for quick smoke tests; prefer a real Azure namespace for production-like testing.
+
+## What's Next?
+
+In [Part 2: Setting up Development Infrastructure](/articles/azure-service-bus-tutorial-part-2-infrastructure-setup), we'll provision an Azure Service Bus development namespace (topics + subscriptions) via Azure CLI, and wire up local services to it.
+
+## Series Navigation
+
+This is **Part 1** of 7 in the Azure Service Bus Tutorial series:
+
+1. **Introduction to Message-Driven Architecture** (📍 You are here)
+2. [Setting up Local Development Infrastructure](/articles/azure-service-bus-tutorial-part-2-infrastructure-setup)
+3. [Building Shared Contracts](/articles/azure-service-bus-tutorial-part-3-shared-contracts)
+4. [Order API with Outbox Pattern](/articles/azure-service-bus-tutorial-part-4-order-api-outbox)
+5. [Creating the Inventory Worker](/articles/azure-service-bus-tutorial-part-5-inventory-worker)
+6. [Adding Observability](/articles/azure-service-bus-tutorial-part-6-observability)
+7. [Testing and Production Deployment](/articles/azure-service-bus-tutorial-part-7-testing-deployment)
+
+---
+
+💬 **Questions or feedback?** Leave a comment below or open an issue on [GitHub](https://github.com/amitsinghrawat1994/OrderSystem)!

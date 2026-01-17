@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using MassTransit;
 
 namespace OrderService.Sagas
@@ -17,6 +17,7 @@ namespace OrderService.Sagas
         public decimal TotalAmount { get; set; }
         public Guid? PaymentId { get; set; } // Just an example of extra data
 
-
+        // Saga timeout tracking
+        public Guid? TimeoutTokenId { get; set; }
     }
 }

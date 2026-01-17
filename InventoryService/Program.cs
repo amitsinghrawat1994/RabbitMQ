@@ -34,6 +34,15 @@ builder.Services.AddMassTransit(x =>
             h.Password(rabbitConfig["Password"] ?? "guest");
         });
 
+        // Retry Policy Configuration with incremental backoff
+        cfg.UseMessageRetry(r =>
+            r.Incremental(
+                retryLimit: 5,
+                initialInterval: TimeSpan.FromMilliseconds(100),
+                intervalIncrement: TimeSpan.FromMilliseconds(100)
+            )
+        );
+
         cfg.ConfigureEndpoints(context);
     });
 });

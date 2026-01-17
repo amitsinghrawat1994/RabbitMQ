@@ -1,0 +1,707 @@
+---
+title: "Building Distributed Sagas - Part 4: Implementing the Order State Machine"
+date: "2026-01-17"
+excerpt: "Build a production-grade saga orchestrator using MassTransit's state machine DSL to coordinate distributed transactions across microservices."
+tags: ["masstransit", "saga", "state-machine", "dotnet", "orchestration", "ef-core"]
+status: "published"
+series: "Building Distributed Sagas with RabbitMQ & MassTransit"
+seriesOrder: 4
+---
+
+# Part 4: Implementing the Order State Machine
+
+The **saga state machine** is the brain of our distributed system. It orchestrates the order workflow across multiple services, maintains state, and handles both success and failure scenarios. In this part, we'll build the `OrderStateMachine` using MassTransit's Automatonymous DSL.
+
+## What is a State Machine Saga?
+
+A state machine saga is a **long-running process** that:
+- Maintains state across asynchronous operations
+- Coordinates multiple services
+- Persists state to survive restarts
+- Correlates events to specific instances
+- Handles compensating actions on failures
+
+### State Machine vs Traditional Code
+
+**Traditional synchronous code:**
+```csharp
+// ❌ Doesn't work in distributed systems
+public async Task ProcessOrder(string orderId)
+{
+    await CheckInventory(orderId);      // Blocks until complete
+    await ProcessPayment(orderId);      // Blocks until complete
+    await CompleteOrder(orderId);       // Blocks until complete
+}
+// What if a service crashes mid-process? State is lost.
+```
+
+**Saga state machine:**
+```csharp
+// ✅ Event-driven, persistent, resilient
+Initially(
+    When(OrderSubmitted)
+        .TransitionTo(Submitted)
+        .Send(CheckInventory)  // Fire and forget, state persisted
+);
+
+During(Submitted,
+    When(StockReserved)
+        .TransitionTo(InventoryReserved)
+        .Send(ProcessPayment)  // State updated, persisted
+);
+// Services can crash and recover - state is preserved
+```
+
+## State Diagram
+
+Our order processing state machine:
+
+```
+                          [OrderSubmitted]
+                                 │
+                                 ▼
+                          ┌──────────┐
+                          │Submitted │
+                          └──────────┘
+                                 │
+                    ┌────────────┴────────────┐
+         [StockReserved]              [StockShortage]
+                    │                         │
+                    ▼                         ▼
+            ┌────────────────┐          ┌────────┐
+            │InventoryReserved│         │ Failed │
+            └────────────────┘          └────────┘
+                    │                         ▲
+        ┌───────────┴───────────┐            │
+ [PaymentAccepted]      [PaymentFailed]      │
+        │                       │             │
+        ▼                       └─────────────┘
+  ┌───────────┐
+  │ Completed │
+  └───────────┘
+```
+
+**States:**
+- `Initial` - Starting point (every saga instance begins here)
+- `Submitted` - Order received, waiting for inventory check
+- `InventoryReserved` - Stock confirmed, waiting for payment
+- `Completed` - Success path (finalized, removed from DB)
+- `Failed` - Failure path (inventory or payment issue)
+
+## Saga State Instance
+
+First, define the persisted state for each saga instance.
+
+Create `OrderService/Sagas/OrderState.cs`:
+
+```csharp
+using System;
+using MassTransit;
+
+namespace OrderService.Sagas
+{
+    /// <summary>
+    /// Saga instance state - persisted to database for each order.
+    /// This is the "memory" of the saga between events.
+    /// </summary>
+    public class OrderState : SagaStateMachineInstance
+    {
+        /// <summary>
+        /// MassTransit correlation ID (unique for each saga instance).
+        /// This is the primary key in the database.
+        /// </summary>
+        public Guid CorrelationId { get; set; }
+        
+        /// <summary>
+        /// Current state name (e.g., "Submitted", "InventoryReserved").
+        /// MassTransit automatically updates this during transitions.
+        /// </summary>
+        public string CurrentState { get; set; } = null!;
+
+        /// <summary>
+        /// Business identifier for the order (used for correlation).
+        /// This is what our messages carry (not CorrelationId).
+        /// </summary>
+        public string OrderId { get; set; } = null!;
+
+        /// <summary>
+        /// When the saga was created (first event received).
+        /// </summary>
+        public DateTime Created { get; set; }
+        
+        /// <summary>
+        /// Last time the saga state was updated.
+        /// </summary>
+        public DateTime Updated { get; set; }
+
+        /// <summary>
+        /// Customer identifier (from OrderSubmitted event).
+        /// </summary>
+        public string CustomerNumber { get; set; } = null!;
+        
+        /// <summary>
+        /// Total order amount (from OrderSubmitted event).
+        /// </summary>
+        public decimal TotalAmount { get; set; }
+        
+        /// <summary>
+        /// Optional: Track payment transaction ID for auditing.
+        /// </summary>
+        public Guid? PaymentId { get; set; }
+    }
+}
+```
+
+**Key Points:**
+- `CorrelationId`: MassTransit's internal saga identifier (Guid, primary key)
+- `OrderId`: Our business identifier (string, used in messages)
+- `CurrentState`: Automatically managed by MassTransit
+- Additional properties store data needed across state transitions
+
+## State Machine Implementation
+
+Create `OrderService/Sagas/OrderStateMachine.cs`:
+
+```csharp
+using System;
+using Contracts;
+using MassTransit;
+
+namespace OrderService.Sagas
+{
+    /// <summary>
+    /// Order saga state machine - orchestrates the order workflow.
+    /// </summary>
+    public class OrderStateMachine : MassTransitStateMachine<OrderState>
+    {
+        public OrderStateMachine()
+        {
+            // ─────────────────────────────────────────────────────────
+            // CORRELATION CONFIGURATION
+            // ─────────────────────────────────────────────────────────
+            
+            // Correlate OrderSubmitted to create new saga instances
+            Event(() => OrderSubmitted, x => x
+                .CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId)
+                .SelectId(context => Guid.NewGuid()) // Generate CorrelationId
+            );
+            
+            // Correlate subsequent events to existing instances by OrderId
+            Event(() => StockReserved, x => x
+                .CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId)
+            );
+            
+            Event(() => StockShortage, x => x
+                .CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId)
+            );
+            
+            Event(() => PaymentAccepted, x => x
+                .CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId)
+            );
+            
+            Event(() => PaymentFailed, x => x
+                .CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId)
+            );
+
+            // Tell MassTransit which property holds the state name
+            InstanceState(x => x.CurrentState);
+
+            // ─────────────────────────────────────────────────────────
+            // STATE TRANSITIONS
+            // ─────────────────────────────────────────────────────────
+
+            // Initial state: Order submitted
+            Initially(
+                When(OrderSubmitted)
+                    .Then(context =>
+                    {
+                        // Capture order data in saga instance
+                        context.Saga.OrderId = context.Message.OrderId;
+                        context.Saga.Created = DateTime.UtcNow;
+                        context.Saga.Updated = DateTime.UtcNow;
+                        context.Saga.CustomerNumber = context.Message.CustomerNumber;
+                        context.Saga.TotalAmount = context.Message.TotalAmount;
+                    })
+                    .TransitionTo(Submitted)
+                    .PublishAsync(context => context.Init<CheckInventory>(new
+                    {
+                        OrderId = context.Saga.OrderId
+                    }))
+            );
+
+            // Submitted state: Waiting for inventory check
+            During(Submitted,
+                // Happy path: Stock is available
+                When(StockReserved)
+                    .Then(context => context.Saga.Updated = DateTime.UtcNow)
+                    .TransitionTo(InventoryReserved)
+                    .PublishAsync(context => context.Init<ProcessPayment>(new
+                    {
+                        OrderId = context.Saga.OrderId,
+                        Amount = context.Saga.TotalAmount,
+                        CardNumber = "test-card-token" // Use real tokens in production!
+                    })),
+
+                // Sad path: Out of stock
+                When(StockShortage)
+                    .Then(context => context.Saga.Updated = DateTime.UtcNow)
+                    .TransitionTo(Failed)
+                    .PublishAsync(context => context.Init<OrderFailed>(new
+                    {
+                        OrderId = context.Saga.OrderId,
+                        Reason = context.Message.Reason
+                    }))
+            );
+
+            // InventoryReserved state: Waiting for payment
+            During(InventoryReserved,
+                // Happy path: Payment successful
+                When(PaymentAccepted)
+                    .Then(context =>
+                    {
+                        context.Saga.Updated = DateTime.UtcNow;
+                        // Optional: Store payment ID for auditing
+                        context.Saga.PaymentId = Guid.NewGuid();
+                    })
+                    .TransitionTo(Completed)
+                    .PublishAsync(context => context.Init<OrderCompleted>(new
+                    {
+                        OrderId = context.Saga.OrderId
+                    }))
+                    .Finalize(), // Remove saga from database (success)
+
+                // Sad path: Payment declined
+                When(PaymentFailed)
+                    .Then(context => context.Saga.Updated = DateTime.UtcNow)
+                    .TransitionTo(Failed)
+                    .PublishAsync(context => context.Init<OrderFailed>(new
+                    {
+                        OrderId = context.Saga.OrderId,
+                        Reason = context.Message.Reason
+                    }))
+                    // TODO: Add compensating action to release inventory
+            );
+
+            // Automatically remove completed sagas from database
+            SetCompletedWhenFinalized();
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // STATE DEFINITIONS
+        // ─────────────────────────────────────────────────────────
+        
+        public State Submitted { get; private set; } = null!;
+        public State InventoryReserved { get; private set; } = null!;
+        public State Completed { get; private set; } = null!;
+        public State Failed { get; private set; } = null!;
+
+        // ─────────────────────────────────────────────────────────
+        // EVENT DEFINITIONS
+        // ─────────────────────────────────────────────────────────
+        
+        public Event<OrderSubmitted> OrderSubmitted { get; private set; } = null!;
+        public Event<StockReserved> StockReserved { get; private set; } = null!;
+        public Event<StockShortage> StockShortage { get; private set; } = null!;
+        public Event<PaymentAccepted> PaymentAccepted { get; private set; } = null!;
+        public Event<PaymentFailed> PaymentFailed { get; private set; } = null!;
+    }
+}
+```
+
+## Understanding the DSL
+
+### Event Correlation
+
+```csharp
+Event(() => OrderSubmitted, x => x
+    .CorrelateBy((instance, context) => instance.OrderId == context.Message.OrderId)
+    .SelectId(context => Guid.NewGuid())
+);
+```
+
+**What this does:**
+1. `CorrelateBy`: Match incoming messages to saga instances by comparing `instance.OrderId` (in DB) with `context.Message.OrderId` (from message)
+2. `SelectId`: For new instances, generate a unique `CorrelationId`
+
+### State Transitions
+
+```csharp
+Initially(
+    When(OrderSubmitted)          // Trigger: Receive OrderSubmitted event
+        .Then(context => { })     // Action: Execute code
+        .TransitionTo(Submitted)  // Transition: Change state
+        .PublishAsync(...)        // Side Effect: Send message
+);
+```
+
+**DSL Methods:**
+- `Initially`: What happens in the `Initial` state
+- `During(State, ...)`: What happens in a specific state
+- `When(Event)`: Event trigger
+- `.Then(context => {})`: Execute synchronous code
+- `.ThenAsync(async context => {})`: Execute async code
+- `.TransitionTo(State)`: Change to new state
+- `.Publish/PublishAsync`: Broadcast event (pub/sub)
+- `.Send/SendAsync`: Send command (direct to queue)
+- `.Finalize()`: Mark saga for removal
+
+### Publishing Messages
+
+```csharp
+.PublishAsync(context => context.Init<ProcessPayment>(new
+{
+    OrderId = context.Saga.OrderId,
+    Amount = context.Saga.TotalAmount,
+    CardNumber = "test-card-token"
+}))
+```
+
+**Why `context.Init<T>`?**  
+MassTransit's `Init` helper ensures the anonymous object conforms to the interface contract at runtime.
+
+## EF Core Persistence Configuration
+
+Create `OrderService/OrderDbContext.cs`:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using MassTransit.EntityFrameworkCoreIntegration;
+using OrderService.Sagas;
+using OrderService.Models;
+
+namespace OrderService
+{
+    public class OrderDbContext : SagaDbContext
+    {
+        public OrderDbContext(DbContextOptions<OrderDbContext> options)
+            : base(options)
+        {
+        }
+
+        // Saga state machine instances
+        public DbSet<OrderState> OrderStates => Set<OrderState>();
+
+        // Final order outcomes (for queries)
+        public DbSet<Order> Orders => Set<Order>();
+
+        protected override IEnumerable<ISagaClassMap> Configurations
+        {
+            get
+            {
+                yield return new OrderStateMap();
+            }
+        }
+    }
+
+    /// <summary>
+    /// EF Core mapping for OrderState saga instances.
+    /// </summary>
+    public class OrderStateMap : SagaClassMap<OrderState>
+    {
+        protected override void Configure(
+            EntityTypeBuilder<OrderState> entity, 
+            ModelBuilder model)
+        {
+            entity.Property(x => x.CurrentState).HasMaxLength(64);
+            entity.Property(x => x.OrderId).HasMaxLength(64).IsRequired();
+            entity.Property(x => x.CustomerNumber).HasMaxLength(64);
+
+            // Index for fast lookups by business ID
+            entity.HasIndex(x => x.OrderId);
+        }
+    }
+}
+```
+
+## MassTransit Configuration in Program.cs
+
+Update `OrderService/Program.cs`:
+
+```csharp
+using Contracts;
+using MassTransit;
+using Microsoft.EntityFrameworkCore;
+using OrderService.Sagas;
+using OrderService;
+
+var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen();
+
+// EF Core Configuration
+builder.Services.AddDbContext<OrderDbContext>(options =>
+{
+    options.UseSqlite(builder.Configuration.GetConnectionString("DefaultConnection"));
+});
+
+// MassTransit Configuration
+builder.Services.AddMassTransit(x =>
+{
+    // Register Saga State Machine with EF Core persistence
+    x.AddSagaStateMachine<OrderStateMachine, OrderState>()
+        .EntityFrameworkRepository(r =>
+        {
+            r.AddDbContext<DbContext, OrderDbContext>((provider, builder) =>
+            {
+                builder.UseSqlite(
+                    provider.GetRequiredService<IConfiguration>()
+                        .GetConnectionString("DefaultConnection")
+                );
+            });
+
+            // SQLite doesn't support row versioning - disable optimistic concurrency
+            r.SetOptimisticConcurrency(false);
+            
+            // Use SQLite-compatible locking
+            r.LockStatementProvider = new SqliteLockStatementProvider();
+        });
+
+    x.UsingRabbitMq((context, cfg) =>
+    {
+        var rabbitConfig = builder.Configuration.GetSection("RabbitMQ");
+        cfg.Host(rabbitConfig["Host"] ?? "localhost", "/", h =>
+        {
+            h.Username(rabbitConfig["Username"] ?? "guest");
+            h.Password(rabbitConfig["Password"] ?? "guest");
+        });
+
+        // Auto-create saga endpoints
+        cfg.ConfigureEndpoints(context);
+    });
+});
+
+var app = builder.Build();
+
+// Apply EF Core migrations on startup
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<OrderDbContext>();
+    db.Database.Migrate();
+}
+
+if (app.Environment.IsDevelopment())
+{
+    app.UseSwagger();
+    app.UseSwaggerUI();
+}
+
+app.MapControllers();
+app.Run();
+```
+
+**Key Configuration:**
+- `AddSagaStateMachine<TStateMachine, TInstance>`: Register the state machine
+- `EntityFrameworkRepository`: Use EF Core for persistence
+- `ConfigureEndpoints`: Auto-create RabbitMQ queues for the saga
+
+## appsettings.json
+
+Add connection string and RabbitMQ config:
+
+```json
+{
+  "ConnectionStrings": {
+    "DefaultConnection": "Data Source=orders.db"
+  },
+  "RabbitMQ": {
+    "Host": "localhost",
+    "Username": "guest",
+    "Password": "guest"
+  },
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "MassTransit": "Debug"
+    }
+  }
+}
+```
+
+## EF Core Migration
+
+Create initial migration:
+
+```powershell
+cd OrderService
+
+# Install EF Core tools (if not already installed)
+dotnet tool install --global dotnet-ef
+
+# Create migration
+dotnet ef migrations add InitialCreate
+
+# Apply migration (or it happens automatically in Program.cs)
+dotnet ef database update
+```
+
+This creates `orders.db` with the `OrderStates` table.
+
+## Testing the State Machine
+
+### Manual Test
+
+1. **Start Infrastructure**:
+   ```powershell
+   docker-compose up -d
+   ```
+
+2. **Start OrderService**:
+   ```powershell
+   dotnet run --project OrderService
+   ```
+
+3. **Publish OrderSubmitted** (using RabbitMQ Management UI):
+   - Go to [http://localhost:15672/#/exchanges](http://localhost:15672/#/exchanges)
+   - Find exchange: `Contracts:OrderSubmitted`
+   - Click "Publish message"
+   - Payload:
+     ```json
+     {
+       "orderId": "test-123",
+       "timestamp": "2026-01-17T10:00:00Z",
+       "customerNumber": "CUST-001",
+       "totalAmount": 99.99
+     }
+     ```
+
+4. **Verify Database**:
+   ```powershell
+   sqlite3 OrderService/orders.db
+   SELECT * FROM OrderStates;
+   ```
+
+   Should show a saga instance in `Submitted` state.
+
+### Unit Test (No Infrastructure)
+
+```csharp
+using MassTransit.Testing;
+using OrderService.Sagas;
+using Xunit;
+
+public class OrderStateMachineTests
+{
+    [Fact]
+    public async Task Should_Transition_To_Submitted_When_Order_Submitted()
+    {
+        await using var provider = new ServiceCollection()
+            .AddMassTransitTestHarness(cfg =>
+            {
+                cfg.AddSagaStateMachine<OrderStateMachine, OrderState>();
+            })
+            .BuildServiceProvider(true);
+
+        var harness = provider.GetRequiredService<ITestHarness>();
+        await harness.Start();
+
+        var orderId = Guid.NewGuid().ToString();
+
+        await harness.Bus.Publish<OrderSubmitted>(new
+        {
+            OrderId = orderId,
+            Timestamp = DateTime.UtcNow,
+            CustomerNumber = "TEST-001",
+            TotalAmount = 100m
+        });
+
+        var sagaHarness = harness.GetSagaStateMachineHarness<OrderStateMachine, OrderState>();
+        
+        // Verify saga created
+        Assert.True(await sagaHarness.Created.Any(x => x.OrderId == orderId));
+        
+        // Verify CheckInventory was published
+        Assert.True(await harness.Published.Any<CheckInventory>());
+    }
+}
+```
+
+## Debugging Tips
+
+### View Saga State
+
+```sql
+-- SQLite command
+SELECT OrderId, CurrentState, Created, Updated 
+FROM OrderStates 
+ORDER BY Created DESC;
+```
+
+### RabbitMQ Queues
+
+After starting OrderService, check [http://localhost:15672/#/queues](http://localhost:15672/#/queues):
+
+Should see:
+- `orders-saga` (saga endpoint)
+- Exchanges: `Contracts:OrderSubmitted`, `Contracts:CheckInventory`, etc.
+
+### Enable Verbose Logging
+
+```json
+// appsettings.Development.json
+{
+  "Logging": {
+    "LogLevel": {
+      "Default": "Information",
+      "MassTransit": "Debug",
+      "OrderService.Sagas": "Trace"
+    }
+  }
+}
+```
+
+## Common Issues
+
+### Issue 1: Saga Not Correlating
+
+**Symptom**: New saga created for every event
+
+**Solution**: Verify `OrderId` property exists on both saga instance and message:
+```csharp
+// OrderState.cs
+public string OrderId { get; set; }
+
+// Messages.cs
+public interface StockReserved
+{
+    string OrderId { get; } // Must match!
+}
+```
+
+### Issue 2: Database Lock Errors
+
+**Symptom**: `SqliteException: database is locked`
+
+**Solution**: Ensure optimistic concurrency is disabled for SQLite:
+```csharp
+r.SetOptimisticConcurrency(false);
+r.LockStatementProvider = new SqliteLockStatementProvider();
+```
+
+### Issue 3: Saga Not Persisting
+
+**Symptom**: Saga state lost after restart
+
+**Solution**: Verify migration applied:
+```powershell
+dotnet ef migrations list
+dotnet ef database update
+```
+
+## Key Takeaways
+
+✅ **State machines orchestrate** distributed transactions  
+✅ **Correlation IDs** link events to saga instances  
+✅ **Persistence** ensures state survives restarts  
+✅ **DSL is declarative** - define states, events, transitions  
+✅ **Finalize()** removes completed sagas from database  
+
+## Next Steps
+
+In **Part 5**, we'll build the worker services (InventoryService and PaymentService) that consume commands and publish events back to the saga.
+
+---
+
+**Previous**: [← Part 3 - Message Contracts](./part-3-message-contracts.mdx)  
+**Next**: [Part 5 - Building Microservices Consumers →](./part-5-microservices-consumers.mdx)

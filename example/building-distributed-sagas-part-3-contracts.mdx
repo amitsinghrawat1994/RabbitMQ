@@ -1,0 +1,672 @@
+---
+title: "Building Distributed Sagas - Part 3: Designing Message Contracts"
+date: "2026-01-17"
+excerpt: "Learn how to design robust message contracts for event-driven microservices using MassTransit conventions and interface-based messages."
+tags: ["masstransit", "messaging", "contracts", "dotnet", "event-driven", "cqrs"]
+status: "published"
+series: "Building Distributed Sagas with RabbitMQ & MassTransit"
+seriesOrder: 3
+---
+
+# Part 3: Designing Message Contracts
+
+In distributed systems, **messages are your API**. Unlike traditional REST APIs where you can iterate quickly, messages in production systems are harder to change because multiple services depend on them. In this part, we'll design a robust contract system for our e-commerce saga.
+
+## Why Interface-Based Messages?
+
+MassTransit uses **interfaces** instead of classes for message definitions:
+
+### ✅ Benefits of Interfaces
+
+1. **Immutability**: Messages are read-only (no setters)
+2. **Polymorphism**: Easy to extend with inheritance
+3. **Testability**: Simple anonymous object initialization
+4. **Serialization**: JSON-friendly, language-agnostic
+5. **Versioning**: Add properties without breaking consumers
+
+### ❌ Why Not Classes?
+
+```csharp
+// ❌ Bad: Mutable class-based message
+public class OrderSubmitted
+{
+    public string OrderId { get; set; }
+    public decimal TotalAmount { get; set; }
+}
+
+// Someone can modify after publish
+var message = new OrderSubmitted { OrderId = "123" };
+message.OrderId = "456"; // Dangerous mutation!
+
+// ✅ Good: Immutable interface
+public interface OrderSubmitted
+{
+    string OrderId { get; }
+    decimal TotalAmount { get; }
+}
+
+// Initialized with anonymous objects (immutable)
+await context.Publish<OrderSubmitted>(new
+{
+    OrderId = "123",
+    TotalAmount = 99.99m
+});
+```
+
+## Events vs Commands vs Queries
+
+Understanding message types is crucial for proper system design:
+
+| Type | Purpose | Naming | Direction | Examples |
+|------|---------|--------|-----------|----------|
+| **Event** | Something happened (past tense) | Noun + Verb (past) | Broadcast (1→many) | `OrderSubmitted`, `StockReserved`, `PaymentAccepted` |
+| **Command** | Do something (imperative) | Verb + Noun | Direct (1→1) | `CheckInventory`, `ProcessPayment` |
+| **Query** | Get information | `Get` + Noun | Request/Response | `GetOrderStatus` |
+
+### Event Example (Pub/Sub)
+```csharp
+// Publisher (Order Service)
+await context.Publish<OrderSubmitted>(new { OrderId = "123" });
+
+// Multiple subscribers can listen
+// - Inventory Service
+// - Notification Service
+// - Analytics Service
+```
+
+### Command Example (Direct)
+```csharp
+// Sender (Saga)
+await context.Send<CheckInventory>(new { OrderId = "123" });
+
+// Single consumer (Inventory Service)
+public class CheckInventoryConsumer : IConsumer<CheckInventory> { }
+```
+
+## Our Message Contracts
+
+Create a new class library project:
+
+```powershell
+dotnet new classlib -n Contracts
+cd Contracts
+dotnet add package MassTransit.Abstractions
+```
+
+### Complete Contracts.cs
+
+```csharp
+using System;
+
+namespace Contracts
+{
+    /// <summary>
+    /// Event: Published when a customer places an order via the API.
+    /// Triggers the saga to begin orchestration.
+    /// </summary>
+    public interface OrderSubmitted
+    {
+        /// <summary>Business identifier for the order (stable across services)</summary>
+        string OrderId { get; }
+        
+        /// <summary>When the order was placed (UTC)</summary>
+        DateTime Timestamp { get; }
+        
+        /// <summary>Customer identifier for CRM/analytics</summary>
+        string CustomerNumber { get; }
+        
+        /// <summary>Total order amount in USD</summary>
+        decimal TotalAmount { get; }
+    }
+
+    /// <summary>
+    /// Command: Saga instructs Inventory Service to check stock availability.
+    /// </summary>
+    public interface CheckInventory
+    {
+        string OrderId { get; }
+    }
+
+    /// <summary>
+    /// Event: Inventory Service publishes when stock is successfully reserved.
+    /// Saga transitions to next state (payment processing).
+    /// </summary>
+    public interface StockReserved
+    {
+        string OrderId { get; }
+    }
+
+    /// <summary>
+    /// Event: Inventory Service publishes when items are out of stock.
+    /// Saga transitions to Failed state.
+    /// </summary>
+    public interface StockShortage
+    {
+        string OrderId { get; }
+        
+        /// <summary>Human-readable reason (e.g., "Item XYZ out of stock")</summary>
+        string Reason { get; }
+    }
+
+    /// <summary>
+    /// Command: Saga instructs Payment Service to charge the customer.
+    /// </summary>
+    public interface ProcessPayment
+    {
+        string OrderId { get; }
+        
+        /// <summary>Amount to charge in USD</summary>
+        decimal Amount { get; }
+        
+        /// <summary>Tokenized card number (NOT raw PAN - use payment gateway tokens!)</summary>
+        string CardNumber { get; }
+    }
+
+    /// <summary>
+    /// Event: Payment Service publishes when payment is successful.
+    /// Saga transitions to Completed state.
+    /// </summary>
+    public interface PaymentAccepted
+    {
+        string OrderId { get; }
+    }
+
+    /// <summary>
+    /// Event: Payment Service publishes when payment fails (e.g., declined card).
+    /// Saga transitions to Failed state.
+    /// </summary>
+    public interface PaymentFailed
+    {
+        string OrderId { get; }
+        
+        /// <summary>Failure reason (e.g., "Insufficient funds")</summary>
+        string Reason { get; }
+    }
+
+    /// <summary>
+    /// Event: Published by saga when order completes successfully.
+    /// Consumed by audit/notification services.
+    /// </summary>
+    public interface OrderCompleted
+    {
+        string OrderId { get; }
+    }
+
+    /// <summary>
+    /// Event: Published by saga when order fails (inventory or payment).
+    /// Consumed by audit/notification services.
+    /// </summary>
+    public interface OrderFailed
+    {
+        string OrderId { get; }
+        string Reason { get; }
+    }
+}
+```
+
+## Message Design Best Practices
+
+### 1. Correlation IDs
+
+Every message MUST have a correlation ID (in our case, `OrderId`):
+
+```csharp
+// ✅ Good: Every message has OrderId
+public interface CheckInventory
+{
+    string OrderId { get; } // Saga correlates by this
+}
+
+// ❌ Bad: No way to correlate
+public interface CheckInventory
+{
+    int ProductId { get; }
+    // How does saga know which order this belongs to?
+}
+```
+
+**Why?**  
+Sagas correlate events to specific instances using correlation IDs.
+
+### 2. Idempotency Tokens
+
+For critical operations, include idempotency keys:
+
+```csharp
+public interface ProcessPayment
+{
+    string OrderId { get; }
+    decimal Amount { get; }
+    
+    // Prevent duplicate charges if message is retried
+    Guid IdempotencyKey { get; }
+}
+```
+
+### 3. Timestamps for Debugging
+
+Always include timestamps for audit trails:
+
+```csharp
+public interface OrderSubmitted
+{
+    string OrderId { get; }
+    DateTime Timestamp { get; } // When was this created?
+}
+```
+
+### 4. Avoid Sensitive Data
+
+**Never put raw PCI data in messages**:
+
+```csharp
+// ❌ NEVER DO THIS
+public interface ProcessPayment
+{
+    string CardNumber { get; } // "4532-1234-5678-9010" - PCI violation!
+    string CVV { get; }         // Extreme security risk
+}
+
+// ✅ Use tokens from payment gateways
+public interface ProcessPayment
+{
+    string PaymentToken { get; } // "tok_abc123" from Stripe/Braintree
+    decimal Amount { get; }
+}
+```
+
+### 5. Message Versioning
+
+Plan for evolution from day one:
+
+```csharp
+// Version 1
+public interface OrderSubmitted
+{
+    string OrderId { get; }
+    string CustomerNumber { get; }
+}
+
+// Version 2 (backward compatible - add optional properties)
+public interface OrderSubmittedV2 : OrderSubmitted
+{
+    string? PromotionCode { get; } // New field, nullable
+}
+
+// Consumers can handle both
+public class OrderConsumer : 
+    IConsumer<OrderSubmitted>,
+    IConsumer<OrderSubmittedV2>
+{
+    public async Task Consume(ConsumeContext<OrderSubmitted> context)
+    {
+        // Handle v1
+    }
+
+    public async Task Consume(ConsumeContext<OrderSubmittedV2> context)
+    {
+        // Handle v2 with promotion logic
+    }
+}
+```
+
+## MassTransit Naming Conventions
+
+MassTransit generates queue and exchange names automatically:
+
+```csharp
+Message Interface          Exchange Name               Queue Name (Consumer)
+────────────────────────────────────────────────────────────────────────────────
+OrderSubmitted            Contracts:OrderSubmitted    (multiple subscribers)
+CheckInventory            Contracts:CheckInventory    inventory-service
+ProcessPayment            Contracts:ProcessPayment    payment-service
+```
+
+**Format**: `{Namespace}:{TypeName}`
+
+### Customizing Names (Optional)
+
+```csharp
+// Default: queue name = assembly name
+cfg.ReceiveEndpoint("custom-queue-name", e =>
+{
+    e.ConfigureConsumer<CheckInventoryConsumer>(context);
+});
+```
+
+## Publishing Messages
+
+### Option 1: Anonymous Objects (Recommended)
+
+```csharp
+// Clean, immutable, testable
+await context.Publish<OrderSubmitted>(new
+{
+    OrderId = "123",
+    Timestamp = DateTime.UtcNow,
+    CustomerNumber = "CUST-001",
+    TotalAmount = 99.99m
+});
+```
+
+### Option 2: Initializer Syntax
+
+```csharp
+// Saga state machine style (explicit Init)
+.PublishAsync(context => context.Init<CheckInventory>(new
+{
+    OrderId = context.Saga.OrderId
+}))
+```
+
+### Option 3: Helper Class (Complex Messages)
+
+```csharp
+public static class MessageFactory
+{
+    public static object CreateOrderSubmitted(
+        string orderId, 
+        string customerNumber, 
+        decimal totalAmount)
+    {
+        return new
+        {
+            OrderId = orderId,
+            Timestamp = DateTime.UtcNow,
+            CustomerNumber = customerNumber,
+            TotalAmount = totalAmount
+        };
+    }
+}
+
+// Usage
+await context.Publish<OrderSubmitted>(
+    MessageFactory.CreateOrderSubmitted("123", "CUST-001", 99.99m)
+);
+```
+
+## Consuming Messages
+
+### Simple Consumer
+
+```csharp
+public class CheckInventoryConsumer : IConsumer<CheckInventory>
+{
+    public async Task Consume(ConsumeContext<CheckInventory> context)
+    {
+        var orderId = context.Message.OrderId;
+        
+        // Business logic...
+        
+        // Publish response event
+        await context.Publish<StockReserved>(new
+        {
+            OrderId = orderId
+        });
+    }
+}
+```
+
+### Accessing Message Metadata
+
+```csharp
+public async Task Consume(ConsumeContext<CheckInventory> context)
+{
+    var orderId = context.Message.OrderId;
+    var messageId = context.MessageId;           // Unique message ID
+    var conversationId = context.ConversationId; // Trace entire workflow
+    var correlationId = context.CorrelationId;   // Link related messages
+    
+    _logger.LogInformation(
+        "Processing {MessageType} for Order {OrderId} (ConversationId: {ConversationId})",
+        nameof(CheckInventory),
+        orderId,
+        conversationId
+    );
+}
+```
+
+## Request/Response Pattern (Optional)
+
+For synchronous-style queries:
+
+```csharp
+// Request
+public interface GetOrderStatus
+{
+    string OrderId { get; }
+}
+
+// Response
+public interface OrderStatus
+{
+    string OrderId { get; }
+    string State { get; }
+    DateTime LastUpdated { get; }
+}
+
+// Consumer (responder)
+public class OrderStatusConsumer : IConsumer<GetOrderStatus>
+{
+    public async Task Consume(ConsumeContext<GetOrderStatus> context)
+    {
+        var status = await _repository.GetStatusAsync(context.Message.OrderId);
+        
+        // Respond directly to requester
+        await context.RespondAsync<OrderStatus>(new
+        {
+            OrderId = context.Message.OrderId,
+            State = status.State,
+            LastUpdated = status.Updated
+        });
+    }
+}
+
+// Requester
+var client = bus.CreateRequestClient<GetOrderStatus>();
+var response = await client.GetResponse<OrderStatus>(new
+{
+    OrderId = "123"
+});
+
+Console.WriteLine($"Order status: {response.Message.State}");
+```
+
+## Testing Message Contracts
+
+### Unit Test: Message Creation
+
+```csharp
+[Fact]
+public void Should_Create_OrderSubmitted_With_Required_Fields()
+{
+    var message = new
+    {
+        OrderId = "test-123",
+        Timestamp = DateTime.UtcNow,
+        CustomerNumber = "CUST-001",
+        TotalAmount = 99.99m
+    };
+
+    // Type check
+    Assert.IsAssignableFrom<object>(message);
+    Assert.Equal("test-123", message.OrderId);
+    Assert.Equal(99.99m, message.TotalAmount);
+}
+```
+
+### Integration Test: Publishing & Consuming
+
+```csharp
+[Fact]
+public async Task Should_Publish_And_Consume_OrderSubmitted()
+{
+    await using var provider = new ServiceCollection()
+        .AddMassTransitTestHarness(cfg =>
+        {
+            cfg.AddConsumer<OrderSubmittedConsumer>();
+        })
+        .BuildServiceProvider(true);
+
+    var harness = provider.GetRequiredService<ITestHarness>();
+    await harness.Start();
+
+    await harness.Bus.Publish<OrderSubmitted>(new
+    {
+        OrderId = "test-123",
+        Timestamp = DateTime.UtcNow,
+        CustomerNumber = "CUST-001",
+        TotalAmount = 99.99m
+    });
+
+    // Verify consumption
+    Assert.True(await harness.Consumed.Any<OrderSubmitted>());
+}
+```
+
+## Common Pitfalls
+
+### ❌ Pitfall 1: Using Classes Instead of Interfaces
+
+```csharp
+// Wrong
+public class OrderSubmitted { }
+
+// Right
+public interface OrderSubmitted { }
+```
+
+### ❌ Pitfall 2: Missing Correlation IDs
+
+```csharp
+// Wrong
+public interface CheckInventory
+{
+    int ProductId { get; }
+    // No way to correlate to saga instance!
+}
+
+// Right
+public interface CheckInventory
+{
+    string OrderId { get; } // Saga correlation property
+    int ProductId { get; }
+}
+```
+
+### ❌ Pitfall 3: Mutable Properties
+
+```csharp
+// Wrong
+public interface OrderSubmitted
+{
+    string OrderId { get; set; } // Settable!
+}
+
+// Right
+public interface OrderSubmitted
+{
+    string OrderId { get; } // Read-only
+}
+```
+
+### ❌ Pitfall 4: Breaking Changes
+
+```csharp
+// Version 1 (deployed in production)
+public interface OrderSubmitted
+{
+    string OrderId { get; }
+    decimal TotalAmount { get; }
+}
+
+// ❌ Version 2 - BREAKING CHANGE
+public interface OrderSubmitted
+{
+    string OrderId { get; }
+    decimal Amount { get; } // Renamed property!
+}
+
+// ✅ Version 2 - Backward compatible
+public interface OrderSubmitted
+{
+    string OrderId { get; }
+    decimal TotalAmount { get; }
+    string? PromotionCode { get; } // New optional property
+}
+```
+
+## Project Structure
+
+Add `Contracts` project to your solution:
+
+```
+ECommerce.sln
+├── Contracts/
+│   ├── Contracts.csproj
+│   └── Messages.cs          ← All message interfaces
+├── OrderService/
+│   └── OrderService.csproj  → References Contracts
+├── InventoryService/
+│   └── InventoryService.csproj → References Contracts
+└── PaymentService/
+    └── PaymentService.csproj → References Contracts
+```
+
+Add references:
+
+```powershell
+dotnet add OrderService/OrderService.csproj reference Contracts/Contracts.csproj
+dotnet add InventoryService/InventoryService.csproj reference Contracts/Contracts.csproj
+dotnet add PaymentService/PaymentService.csproj reference Contracts/Contracts.csproj
+```
+
+## Message Flow Summary
+
+Here's how our messages flow through the system:
+
+```
+[Client] → POST /Order
+         ↓
+[OrderService] publishes OrderSubmitted
+         ↓
+[Saga] receives OrderSubmitted → sends CheckInventory
+         ↓
+[InventoryService] receives CheckInventory
+         ↓ (happy path)
+[InventoryService] publishes StockReserved
+         ↓
+[Saga] receives StockReserved → sends ProcessPayment
+         ↓
+[PaymentService] receives ProcessPayment
+         ↓ (happy path)
+[PaymentService] publishes PaymentAccepted
+         ↓
+[Saga] receives PaymentAccepted → publishes OrderCompleted
+         ↓
+[Final State: Completed]
+```
+
+## Key Takeaways
+
+✅ **Use interfaces, not classes** for message contracts  
+✅ **Events are past tense**, commands are imperative  
+✅ **Always include correlation IDs** for saga correlation  
+✅ **Plan for versioning** from day one (add, don't remove properties)  
+✅ **Never put sensitive data** in messages (use tokens)  
+✅ **Document message purposes** with XML comments  
+
+## Next Steps
+
+Now that we have our contract foundation, we'll build the heart of our system: the Order State Machine saga.
+
+In **Part 4**, we'll:
+- Implement `OrderStateMachine` with MassTransit
+- Define states and transitions
+- Configure saga persistence with EF Core and SQLite
+- Handle event correlation by OrderId
+
+---
+
+**Previous**: [← Part 2 - Infrastructure Setup](./part-2-infrastructure-setup.mdx)  
+**Next**: [Part 4 - Implementing the Order State Machine →](./part-4-order-state-machine.mdx)

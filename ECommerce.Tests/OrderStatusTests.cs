@@ -7,6 +7,8 @@ using OrderService.Controllers;
 using OrderService.Models;
 using OrderService.Sagas;
 using Xunit;
+using Microsoft.Extensions.Logging;
+using Moq;
 
 namespace ECommerce.Tests
 {
@@ -25,7 +27,8 @@ namespace ECommerce.Tests
             db.Orders.Add(new OrderService.Models.Order { OrderId = orderId, Status = "Completed", CreatedAt = DateTime.UtcNow, CompletedAt = DateTime.UtcNow });
             await db.SaveChangesAsync();
 
-            var controller = new OrderController(null!, db);
+            var mockLogger = new Mock<ILogger<OrderController>>();
+            var controller = new OrderController(null!, db, mockLogger.Object);
 
             var res = await controller.GetStatus(orderId);
             var ok = Assert.IsType<OkObjectResult>(res);
@@ -51,7 +54,8 @@ namespace ECommerce.Tests
             db.Orders.Add(new OrderService.Models.Order { OrderId = orderId, Status = "Failed", CreatedAt = DateTime.UtcNow, CompletedAt = DateTime.UtcNow, Reason = "no stock" });
             await db.SaveChangesAsync();
 
-            var controller = new OrderController(null!, db);
+            var mockLogger = new Mock<ILogger<OrderController>>();
+            var controller = new OrderController(null!, db, mockLogger.Object);
 
             var res = await controller.GetStatus(orderId);
             var ok = Assert.IsType<OkObjectResult>(res);
@@ -80,7 +84,8 @@ namespace ECommerce.Tests
             db.Set<OrderState>().Add(new OrderState { CorrelationId = Guid.NewGuid(), OrderId = orderId, CurrentState = "Submitted", Created = DateTime.UtcNow, Updated = DateTime.UtcNow, CustomerNumber = "X", TotalAmount = 10.0m });
             await db.SaveChangesAsync();
 
-            var controller = new OrderController(null!, db);
+            var mockLogger = new Mock<ILogger<OrderController>>();
+            var controller = new OrderController(null!, db, mockLogger.Object);
 
             var res = await controller.GetStatus(orderId);
             var ok = Assert.IsType<OkObjectResult>(res);
@@ -102,7 +107,8 @@ namespace ECommerce.Tests
             using var scope = provider.CreateScope();
             var db = scope.ServiceProvider.GetRequiredService<OrderDbContext>();
 
-            var controller = new OrderController(null!, db);
+            var mockLogger = new Mock<ILogger<OrderController>>();
+            var controller = new OrderController(null!, db, mockLogger.Object);
 
             var res = await controller.GetStatus(Guid.NewGuid().ToString());
             Assert.IsType<NotFoundResult>(res);

@@ -9,6 +9,8 @@ using OrderService.Controllers;
 using OrderService.Models;
 using Microsoft.EntityFrameworkCore;
 using Xunit;
+using Microsoft.Extensions.Logging;
+using Moq;
 
 namespace ECommerce.Tests
 {
@@ -32,7 +34,8 @@ namespace ECommerce.Tests
             using var scope2 = provider2.CreateScope();
             var db = scope2.ServiceProvider.GetRequiredService<OrderService.Sagas.OrderDbContext>();
 
-            var controller = new OrderController(harness.Bus, db);
+            var mockLogger = new Mock<ILogger<OrderController>>();
+            var controller = new OrderController(harness.Bus, db, mockLogger.Object);
             var request = new OrderRequest
             {
                 CustomerNumber = "12345",

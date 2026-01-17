@@ -1,0 +1,308 @@
+---
+title: "Building Distributed Sagas with RabbitMQ & MassTransit - Part 1: Introduction"
+date: "2026-01-17"
+excerpt: "Learn how to implement the Saga orchestration pattern in .NET microservices using MassTransit and RabbitMQ for building reliable, distributed e-commerce systems."
+tags: ["rabbitmq", "masstransit", "dotnet", "microservices", "saga-pattern", "distributed-systems"]
+status: "published"
+series: "Building Distributed Sagas with RabbitMQ & MassTransit"
+seriesOrder: 1
+---
+
+# Building Distributed Sagas with RabbitMQ & MassTransit - Part 1: Introduction
+
+In distributed microservices architectures, managing complex business transactions that span multiple services is one of the most challenging problems. The **Saga Pattern** provides an elegant solution for orchestrating long-running business processes across distributed systems. In this series, we'll build a production-grade e-commerce order processing system using **.NET 10**, **MassTransit**, and **RabbitMQ**.
+
+## What is the Saga Pattern?
+
+The Saga Pattern is a design pattern for managing distributed transactions by breaking them into a series of local transactions, each with a compensating action. Unlike traditional ACID transactions that lock resources, sagas maintain data consistency through event-driven choreography or orchestration.
+
+### Two Approaches to Sagas
+
+**1. Choreography** (Event-Driven)
+- Services communicate through events
+- Each service listens and reacts independently
+- No central coordinator
+- Best for simple workflows
+
+**2. Orchestration** (State Machine)
+- Central orchestrator controls the flow
+- Explicit state management
+- Better visibility and debugging
+- **This is what we'll build**
+
+## Why MassTransit + RabbitMQ?
+
+### MassTransit Benefits
+- **State Machine DSL**: Declarative saga definitions using Automatonymous
+- **Built-in Patterns**: Request/Response, Publish/Subscribe, Saga orchestration
+- **Persistence**: EF Core integration for saga state
+- **Observability**: OpenTelemetry integration out-of-the-box
+- **Testing**: Comprehensive test harness for unit and integration tests
+
+### RabbitMQ vs Alternatives
+
+| Feature | RabbitMQ | Azure Service Bus | Apache Kafka |
+|---------|----------|------------------|--------------|
+| **Deployment** | Self-hosted, Docker-friendly | Fully managed (Azure) | Self-hosted or Confluent |
+| **Message Patterns** | Queues, Exchanges, Routing | Queues, Topics | Topics, Partitions |
+| **Saga Support** | Excellent (MassTransit) | Excellent (MassTransit) | Limited (not designed for sagas) |
+| **Max Message Size** | Configurable (default 128MB) | 256 KB (1 MB Premium) | 1 MB default |
+| **FIFO Guarantee** | Yes (single queue) | Yes (sessions) | Yes (partitions) |
+| **Dead Letter Queue** | Yes (built-in) | Yes (built-in) | No (manual implementation) |
+| **Local Development** | Excellent (Docker) | Emulator limited | Complex setup |
+| **Cost** | Infrastructure only | Pay-per-use | Infrastructure costs |
+| **Best For** | Traditional messaging, microservices | Azure-native apps | Event streaming, high-throughput logs |
+
+**Choose RabbitMQ if you:**
+- Want full control over infrastructure
+- Need local development with zero cloud dependencies
+- Require flexible routing patterns (topic exchanges, headers)
+- Have existing RabbitMQ expertise
+
+## Real-World E-Commerce Order System
+
+We'll build an order processing system that demonstrates:
+
+✅ **Saga orchestration** with state machines  
+✅ **Event-driven architecture** with publish/subscribe  
+✅ **Failure handling** with retries and compensations  
+✅ **Deterministic testing** for predictable scenarios  
+✅ **Observability** with distributed tracing  
+✅ **Persistence** with SQLite and EF Core  
+
+### System Architecture
+
+```
+┌─────────────┐
+│   Client    │
+│  (HTTP API) │
+└──────┬──────┘
+       │ POST /Order
+       ▼
+┌─────────────────────────────────────┐
+│      Order Service                  │
+│  ┌───────────────────────────────┐  │
+│  │  Order State Machine (Saga)   │  │
+│  │  ┌─────────────────────────┐  │  │
+│  │  │ Initial → Submitted     │  │  │
+│  │  │ Submitted → Reserved    │  │  │
+│  │  │ Reserved → Completed    │  │  │
+│  │  │ Any → Failed            │  │  │
+│  │  └─────────────────────────┘  │  │
+│  │  Persisted to SQLite          │  │
+│  └───────────────────────────────┘  │
+└─────────┬───────────────────────────┘
+          │
+          ├────────────────┐
+          ▼                ▼
+  ┌──────────────┐  ┌──────────────┐
+  │  RabbitMQ    │  │  RabbitMQ    │
+  │   Exchange   │  │   Exchange   │
+  └──────┬───────┘  └──────┬───────┘
+         │                 │
+         ▼                 ▼
+┌─────────────────┐ ┌─────────────────┐
+│ Inventory       │ │ Payment         │
+│ Service         │ │ Service         │
+│ - Check stock   │ │ - Process       │
+│ - Reserve item  │ │ - Retry logic   │
+└─────────────────┘ └─────────────────┘
+```
+
+### Message Flow (Happy Path)
+
+1. **Client** → `POST /Order` → **Order Service**
+2. **Order Service** → Publish `OrderSubmitted` → **Saga**
+3. **Saga** → Send `CheckInventory` → **Inventory Service**
+4. **Inventory Service** → Publish `StockReserved` → **Saga**
+5. **Saga** → Send `ProcessPayment` → **Payment Service**
+6. **Payment Service** → Publish `PaymentAccepted` → **Saga**
+7. **Saga** → Publish `OrderCompleted` → Final State
+
+### Deterministic Testing Strategy
+
+One of the unique features of this implementation is **GUID-based deterministic testing**:
+
+- **OrderId ending in `0`** → Inventory publishes `StockShortage`
+- **OrderId ending in `1`** → Payment publishes `PaymentFailed` (hard failure)
+- **OrderId ending in `2`** → Payment throws exception (triggers retries → DLQ)
+- **Any other OrderId** → Happy path (success)
+
+This allows for predictable, reproducible testing without mocking.
+
+## Project Structure
+
+```
+ECommerce/
+├── Contracts/                      # Shared message definitions
+│   └── Messages.cs                 # Event & command interfaces
+├── OrderService/                   # API + Saga orchestrator
+│   ├── Controllers/
+│   │   └── OrderController.cs     # REST API endpoints
+│   ├── Sagas/
+│   │   ├── OrderStateMachine.cs   # State machine definition
+│   │   └── OrderState.cs          # Saga instance state
+│   ├── Consumers/
+│   │   ├── OrderCompletedConsumer.cs
+│   │   └── OrderFailedConsumer.cs
+│   └── Program.cs                 # MassTransit configuration
+├── InventoryService/               # Stock management worker
+│   ├── CheckInventoryConsumer.cs
+│   └── Program.cs
+├── PaymentService/                 # Payment processing worker
+│   ├── ProcessPaymentConsumer.cs
+│   └── Program.cs                 # Retry policy configuration
+├── ECommerce.Tests/                # Test harness tests
+│   ├── OrderSagaTests.cs
+│   └── OrderPersistenceTests.cs
+└── docker-compose.yml              # RabbitMQ + Observability stack
+```
+
+## What You'll Learn in This Series
+
+This **8-part tutorial** covers:
+
+1. **Introduction** (this post) - Saga pattern fundamentals
+2. **Infrastructure Setup** - Docker, RabbitMQ, Jaeger, OTEL Collector
+3. **Message Contracts** - Designing events & commands
+4. **State Machine Implementation** - Building the Order saga
+5. **Microservices Consumers** - Inventory & Payment workers
+6. **Error Handling** - Retries, compensations, and DLQ
+7. **Testing** - MassTransit TestHarness strategies
+8. **Observability** - OpenTelemetry distributed tracing
+
+## Prerequisites
+
+### Required Software
+- **.NET 10 SDK** - [Download](https://dotnet.microsoft.com/download/dotnet/10.0)
+- **Docker Desktop** - [Download](https://www.docker.com/products/docker-desktop)
+- **Visual Studio 2022** or **VS Code** with C# Dev Kit
+- **Git** for version control
+
+### Knowledge Prerequisites
+- Intermediate C# and ASP.NET Core
+- Basic understanding of async/await
+- Familiarity with REST APIs
+- Basic Docker concepts (containers, volumes, compose)
+- Understanding of message queues (helpful but not required)
+
+### Verify Your Setup
+
+```powershell
+# Check .NET version (should be 10.0.x)
+dotnet --version
+
+# Check Docker is running
+docker --version
+docker ps
+
+# Pull RabbitMQ image (saves time later)
+docker pull rabbitmq:3-management
+```
+
+## Complete Source Code
+
+📦 **GitHub Repository**: [github.com/yourusername/ecommerce-saga-rabbitmq](https://github.com/yourusername/ecommerce-saga-rabbitmq)
+
+### Branch Structure
+- `main` - Complete working solution
+- `part-1-introduction` - Setup and scaffolding
+- `part-2-infrastructure` - Docker Compose
+- `part-3-contracts` - Message definitions
+- `part-4-saga` - State machine implementation
+- `part-5-consumers` - Worker services
+- `part-6-error-handling` - Retry policies
+- `part-7-testing` - Test harness
+- `part-8-observability` - OpenTelemetry integration
+
+## Quick Start (Sneak Peek)
+
+Want to see it in action? Here's a 2-minute quick start:
+
+```powershell
+# Clone the repository
+git clone https://github.com/yourusername/ecommerce-saga-rabbitmq
+cd ecommerce-saga-rabbitmq
+
+# Start RabbitMQ
+docker-compose up -d
+
+# Start all services (use VS Code "All Services" launch config)
+# OR run manually in 3 terminals:
+dotnet run --project OrderService
+dotnet run --project InventoryService
+dotnet run --project PaymentService
+
+# Submit a test order
+curl -X POST http://localhost:5085/Order \
+  -H "Content-Type: application/json" \
+  -d '{"customerNumber": "CUST-001", "totalAmount": 99.99}'
+
+# Check RabbitMQ Management UI
+# http://localhost:15672 (guest/guest)
+```
+
+## Key Concepts We'll Cover
+
+### 1. Event-Driven Architecture
+- **Events** vs **Commands** vs **Queries**
+- Publish/Subscribe patterns
+- Message correlation and routing
+
+### 2. State Machine Design
+- Defining states and transitions
+- Event correlation by OrderId
+- Persisting saga state with EF Core
+
+### 3. Resilience Patterns
+- Retry policies with exponential backoff
+- Dead Letter Queues (DLQ) for poison messages
+- Compensating transactions for failures
+
+### 4. Testing Strategies
+- In-memory test harness (no infrastructure)
+- Saga harness for state verification
+- Deterministic testing with controlled failures
+
+### 5. Observability
+- OpenTelemetry instrumentation
+- Distributed tracing with Jaeger
+- Correlation IDs across services
+
+## Why This Matters
+
+In production microservices:
+- **95% of complexity** is in handling failures, not happy paths
+- **Saga patterns** prevent data inconsistency across services
+- **Proper testing** prevents costly production bugs
+- **Observability** is critical for debugging distributed systems
+
+## Coming Up Next
+
+In **Part 2**, we'll set up the complete infrastructure:
+- RabbitMQ with management UI
+- Jaeger for distributed tracing
+- OpenTelemetry Collector
+- Docker Compose orchestration
+- VS Code debugging configuration
+
+We'll also explore RabbitMQ concepts:
+- Exchanges, Queues, and Bindings
+- Topic exchanges for event routing
+- Dead Letter Queues (DLQ)
+- Message durability and persistence
+
+## Resources
+
+- [MassTransit Documentation](https://masstransit.io/)
+- [RabbitMQ Tutorials](https://www.rabbitmq.com/getstarted.html)
+- [Saga Pattern - Microsoft](https://learn.microsoft.com/en-us/azure/architecture/reference-architectures/saga/saga)
+- [OpenTelemetry .NET](https://opentelemetry.io/docs/languages/net/)
+
+## Questions or Feedback?
+
+Leave a comment below or reach out on [Twitter/X @yourusername](https://twitter.com/yourusername). I'd love to hear about your experiences with saga patterns and distributed systems!
+
+---
+
+**Next**: [Part 2 - Infrastructure Setup with Docker & RabbitMQ →](./part-2-infrastructure-setup.mdx)
